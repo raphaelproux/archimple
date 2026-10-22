@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>archimple</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <div class="brand">archimple</div>
+    <div class="tools">
+      <button data-tool="select" class="active" title="Select / drag (S)">&#9633; Select</button>
+      <button data-tool="wall" title="Draw wall (W)">Wall</button>
+      <button data-tool="dim" title="Distance constraint (D)">Dimension</button>
+      <button data-tool="angle" title="Angle constraint (A)">Angle</button>
+      <button data-tool="coincident" title="Coincident points (C)">Coincident</button>
+      <button data-tool="horizontal" title="Horizontal wall (H)">Horizontal</button>
+      <button data-tool="vertical" title="Vertical wall (V)">Vertical</button>
+    </div>
+    <div class="right">
+      <label class="snaplabel">wall <input id="wall-thickness" value="0.2 m" autocomplete="off" spellcheck="false"></label>
+      <label class="snaplabel"><input type="checkbox" id="show-constraints" checked> Constraints</label>
+      <button id="unit-m" class="unit active">m</button>
+      <button id="unit-cm" class="unit">cm</button>
+      <button id="solve-btn" title="Re-solve constraints">Solve</button>
+    </div>
+  </header>
+  <main>
+    <div id="canvas-wrap">
+      <canvas id="board"></canvas>
+      <div id="hint"></div>
+      <div id="dialog" hidden>
+        <label id="dialog-label" for="dialog-input"></label>
+        <input id="dialog-input" type="text" autocomplete="off" spellcheck="false">
+        <div class="dialog-buttons">
+          <button id="dialog-ok">OK</button>
+          <button id="dialog-cancel">Cancel</button>
+        </div>
+      </div>
+    </div>
+    <aside>
+      <h2>Constraints</h2>
+      <ul id="constraint-list"></ul>
+      <div id="status"></div>
+    </aside>
+  </main>
+  <footer>
+    <span id="coords"></span>
+    <span id="solver"></span>
+    <span id="conn">connecting…</span>
+  </footer>
+  <script src="/app.js"></script>
+</body>
+</html>
