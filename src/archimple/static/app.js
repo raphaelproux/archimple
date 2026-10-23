@@ -762,6 +762,17 @@ function updateHover(w) {
   canvas.style.cursor = tool === "select" ? (hover ? "move" : "default") : "crosshair";
 }
 
+canvas.addEventListener("dblclick", (e) => {
+  if (!dialogEl.hidden || tool !== "select") return;
+  const c = pickConstraint(eventWorld(e));
+  if (!c) return;
+  e.preventDefault();
+  selection = { kind: "constraint", id: c.id };
+  syncPanel();
+  draw();
+  editConstraint(c);
+});
+
 canvas.addEventListener("pointerdown", (e) => {
   if (!dialogEl.hidden) return;
   try { canvas.setPointerCapture(e.pointerId); } catch {}
@@ -1107,6 +1118,18 @@ function openDialog(labelText, value, parse, onSubmit) {
   dialogInput.select();
 }
 
+function editConstraint(c) {
+  if (c.type === "distance") {
+    openDialog("Distance", fmtLen(c.length), parseLen, (value) => {
+      send({ op: "update_constraint", id: c.id, value });
+    });
+  } else if (c.type === "angle") {
+    openDialog("Angle (degrees)", fmtDeg(Math.abs(c.degrees)), parseAngle, (value) => {
+      send({ op: "update_constraint", id: c.id, value });
+    });
+  }
+}
+
 function closeDialog(ok) {
   if (dialogEl.hidden) return;
   const raw = dialogInput.value;
@@ -1178,8 +1201,16 @@ function syncPanel() {
     });
     li.addEventListener("click", () => {
       selection = { kind: "constraint", id: c.id };
+      for (const row of listEl.children) row.classList.toggle("selected", row === li);
+      draw();
+    });
+    li.addEventListener("dblclick", (e) => {
+      e.stopPropagation();
+      if (e.target.closest("button")) return;
+      selection = { kind: "constraint", id: c.id };
       syncPanel();
       draw();
+      editConstraint(c);
     });
     li.append(name, desc, del);
     listEl.appendChild(li);
