@@ -67,6 +67,91 @@ def test_vertex_edge_dimension_sets_thickness():
     assert math.hypot(c1.x - c0.x, c1.y - c0.y) == pytest.approx(0.4, abs=1e-6)
 
 
+def test_opening_length_dimension_pulls_handles_to_target_length():
+    doc = Document()
+    wall = make_wall(doc, (0, 0), (4, 0))
+    opening = doc.add_opening(wall.id, 1, 2)
+    doc.add_constraint({
+        "type": "distance",
+        "a": {"kind": "opening", "opening": opening.id, "handle": "start"},
+        "b": {"kind": "opening", "opening": opening.id, "handle": "end"},
+        "length": 1.5,
+    })
+    status = solve_document(doc)
+    assert status.converged
+    assert opening.length == pytest.approx(1.5, abs=1e-6)
+
+
+def test_vertex_opening_handle_dimension_moves_handle_along_host_axis():
+    doc = Document()
+    host = make_wall(doc, (0, 0), (4, 0))
+    target = make_wall(doc, (0.6, 0.5), (1.6, 0.5))
+    opening = doc.add_opening(host.id, 0.8, 1.8)
+    target_pid = target.corners[0]
+    doc.add_constraint({
+        "type": "distance",
+        "a": {"kind": "opening", "opening": opening.id, "handle": "start"},
+        "b": {"kind": "vertex", "pid": target_pid},
+        "length": 0.6,
+    })
+    status = solve_document(doc, pinned=set(host.corners + target.corners))
+    assert status.converged
+    assert opening.start == pytest.approx(0.6, abs=5e-5)
+
+
+def test_opening_handle_to_edge_dimension_moves_handle_along_host_axis():
+    doc = Document()
+    host = make_wall(doc, (0, 0), (4, 0))
+    target = make_wall(doc, (2, -1), (2, 1))
+    opening = doc.add_opening(host.id, 0.5, 1.5)
+    doc.add_constraint({
+        "type": "distance",
+        "a": {"kind": "edge", "wall": target.id, "side": 1},
+        "b": {"kind": "opening", "opening": opening.id, "handle": "start"},
+        "length": 1.0,
+    })
+    status = solve_document(doc, pinned=set(host.corners + target.corners))
+    assert status.converged
+    assert opening.start == pytest.approx(0.9, abs=1e-5)
+
+
+def test_distance_between_opening_handle_and_wall_axis_end():
+    doc = Document()
+    wall = make_wall(doc, (0, 0), (4, 0))
+    opening = doc.add_opening(wall.id, 1, 2)
+    doc.add_constraint({
+        "type": "distance",
+        "a": {"kind": "opening", "opening": opening.id, "handle": "start"},
+        "b": {"kind": "wall-end", "wall": wall.id, "end": "start"},
+        "length": 1,
+    })
+    doc.add_constraint({
+        "type": "distance",
+        "a": {"kind": "opening", "opening": opening.id, "handle": "end"},
+        "b": {"kind": "wall-end", "wall": wall.id, "end": "end"},
+        "length": 1.5,
+    })
+    status = solve_document(doc, pinned=set(wall.corners))
+    assert status.converged
+    assert opening.length == pytest.approx(1.5, abs=1e-6)
+
+
+def test_opening_length_reference_sets_opening_length():
+    doc = Document()
+    host = make_wall(doc, (0, 0), (4, 0))
+    target = make_wall(doc, (1, 0.5), (2, 0.5))
+    opening = doc.add_opening(host.id, 0.5, 1.5)
+    doc.add_constraint({
+        "type": "distance",
+        "a": {"kind": "opening-length", "opening": opening.id},
+        "b": {"kind": "vertex", "pid": target.corners[0]},
+        "length": 1.5,
+    })
+    status = solve_document(doc, pinned=set(host.corners + target.corners))
+    assert status.converged
+    assert opening.length == pytest.approx(1.5, abs=1e-5)
+
+
 def test_coincident_between_corners_pulls_together():
     doc = Document()
     w1 = make_wall(doc, (0, 0), (3, 0))

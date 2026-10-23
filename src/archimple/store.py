@@ -42,6 +42,12 @@ class Hub:
             self._solve(pinned=list(points), max_iter=25)
         elif kind == "drag_end":
             self._solve()
+        elif kind == "add_opening":
+            doc.add_opening(op["wall"], float(op["start"]), float(op["end"]))
+            self._solve()
+        elif kind == "update_opening":
+            doc.update_opening(op["id"], float(op["start"]), float(op["end"]))
+            self._solve()
         elif kind == "add_constraint":
             doc.add_constraint(op["constraint"])
             self._solve()

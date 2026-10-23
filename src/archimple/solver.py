@@ -58,19 +58,28 @@ def _coincident_rows(pa, pb, a: str, b: str) -> list[Row]:
     ]
 
 
-def _distance_rows(pa, pb, a: str, b: str, length: float) -> list[Row]:
-    (ax, ay), (bx, by) = pa, pb
-    dx, dy = bx - ax, by - ay
+def _position_derivs(pid: str) -> list[tuple[str, int, float, float]]:
+    return [(pid, 0, 1.0, 0.0), (pid, 1, 0.0, 1.0)]
+
+
+def _distance_point_rows(pa, pb, da, db, length: float) -> list[Row]:
+    dx, dy = pb[0] - pa[0], pb[1] - pa[1]
     d = math.hypot(dx, dy)
-    if d < 1e-9:
-        ux, uy = 1.0, 0.0
-    else:
-        ux, uy = dx / d, dy / d
-    return [(d - length, [(a, 0, -ux), (a, 1, -uy), (b, 0, ux), (b, 1, uy)])]
+    ux, uy = (1.0, 0.0) if d < 1e-9 else (dx / d, dy / d)
+    derivs = [
+        (key, comp, -ux * x - uy * y) for key, comp, x, y in da
+    ] + [(key, comp, ux * x + uy * y) for key, comp, x, y in db]
+    return [(d - length, derivs)]
 
 
 def _point_edge_rows(
-    pp, P, Q, p_pid: str, P_pid: str, Q_pid: str, offset: float
+    pp,
+    P,
+    Q,
+    p_derivs: list[tuple[str, int, float, float]],
+    P_pid: str,
+    Q_pid: str,
+    offset: float,
 ) -> list[Row]:
     """Signed distance from the P–Q edge line to point pp.
 
@@ -90,7 +99,7 @@ def _point_edge_rows(
     return [(
         d - offset,
         [
-            (p_pid, 0, nx), (p_pid, 1, ny),
+            *[(pid, comp, x * nx + y * ny) for pid, comp, x, y in p_derivs],
             (P_pid, 0, -nx - gx), (P_pid, 1, -ny - gy),
             (Q_pid, 0, gx), (Q_pid, 1, gy),
         ],
@@ -172,6 +181,79 @@ def _edge_pids(doc: Document, ref: dict) -> tuple[str, str] | None:
     return w.corners[i], w.corners[3 if ref["side"] > 0 else 2]
 
 
+def _ref_position(doc: Document, ref: dict, get, get_station):
+    if ref["kind"] == "vertex":
+        pid = ref["pid"]
+        return get(pid), _position_derivs(pid)
+    if ref["kind"] == "edge":
+        pids = _edge_pids(doc, ref)
+        if pids is None:
+            return None
+        pid = pids[0]
+        return get(pid), _position_derivs(pid)
+    if ref["kind"] == "wall-end":
+        wall = doc.walls.get(ref["wall"])
+        if wall is None or len(wall.corners) != 4:
+            return None
+        pids = wall.corners[:2] if ref["end"] == "start" else wall.corners[2:]
+        derivs = []
+        for pid in pids:
+            derivs.extend([
+                (pid, 0, 0.5, 0.0),
+                (pid, 1, 0.0, 0.5),
+            ])
+        position = tuple(
+            sum(get(pid)[comp] for pid in pids) / 2 for comp in (0, 1)
+        )
+        return position, derivs
+    if ref["kind"] == "opening-length":
+        opening = doc.openings.get(ref["opening"])
+        if opening is None:
+            return None
+        i = f"@{opening.id}:length"
+        return (get_station(opening)[1], 0.0), [(i, 0, 1.0, 0.0)]
+
+    opening = doc.openings.get(ref["opening"])
+    wall = doc.walls.get(opening.wall) if opening else None
+    if wall is None or len(wall.corners) != 4:
+        return None
+    c0, c1, c2, c3 = wall.corners
+    start0, start1 = get(c0), get(c1)
+    end0, end1 = get(c2), get(c3)
+    start = ((start0[0] + start1[0]) / 2, (start0[1] + start1[1]) / 2)
+    end = ((end0[0] + end1[0]) / 2, (end0[1] + end1[1]) / 2)
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    length = math.hypot(dx, dy)
+    if length < 1e-9:
+        return None
+    opening_start, opening_length = get_station(opening)
+    station = (
+        opening_start
+        if ref["handle"] == "start"
+        else opening_start + opening_length
+    )
+    alpha = station / length
+    ux, uy = dx / length, dy / length
+    mxx, mxy, myy = uy * uy, -ux * uy, ux * ux
+    start_xx, start_xy, start_yy = 1 - alpha * mxx, -alpha * mxy, 1 - alpha * myy
+    end_xx, end_xy, end_yy = alpha * mxx, alpha * mxy, alpha * myy
+    derivs = [(f"@{opening.id}:start", 0, ux, uy)]
+    if ref["handle"] == "end":
+        derivs.append((f"@{opening.id}:length", 0, ux, uy))
+    for pid in (c0, c1):
+        derivs.extend([
+            (pid, 0, start_xx / 2, start_xy / 2),
+            (pid, 1, start_xy / 2, start_yy / 2),
+        ])
+    for pid in (c2, c3):
+        derivs.extend([
+            (pid, 0, end_xx / 2, end_xy / 2),
+            (pid, 1, end_xy / 2, end_yy / 2),
+        ])
+    position = (start[0] + alpha * dx, start[1] + alpha * dy)
+    return position, derivs
+
+
 def solve_document(
     doc: Document,
     pinned: tuple[str, ...] | set[str] = (),
@@ -180,26 +262,71 @@ def solve_document(
 ) -> SolveStatus:
     pinned = set(pinned)
     free = [p for p in doc.points.values() if p.id not in pinned]
-    index = {p.id: i for i, p in enumerate(free)}
-    n = 2 * len(free)
+    point_index = {p.id: i for i, p in enumerate(free)}
+    opening_index = {oid: len(free) + i for i, oid in enumerate(doc.openings)}
+    n = 2 * (len(free) + len(opening_index))
 
     def pt(coords: np.ndarray):
+        def get_station(opening):
+            i = opening_index[opening.id]
+            return float(coords[2 * i]), float(coords[2 * i + 1])
+
         def get(pid: str) -> tuple[float, float]:
-            i = index.get(pid)
+            i = point_index.get(pid)
             if i is None:
                 p = doc.points[pid]
                 return p.x, p.y
             return float(coords[2 * i]), float(coords[2 * i + 1])
 
-        return get
+        return get, get_station
 
     def evaluate(coords: np.ndarray, want_jac: bool) -> tuple[np.ndarray, np.ndarray]:
-        get = pt(coords)
+        get, get_station = pt(coords)
         rows: list[Row] = []
         # hidden per-wall constraints
         for w in doc.walls.values():
             if all(pid in doc.points for pid in w.corners):
                 rows.extend(_wall_hidden_rows(w, get))
+        for opening in doc.openings.values():
+            i = opening_index[opening.id]
+            start = float(coords[2 * i])
+            length = float(coords[2 * i + 1])
+            wall = doc.walls.get(opening.wall)
+            if wall is None:
+                continue
+            axis_start = tuple(
+                (get(wall.corners[0])[comp] + get(wall.corners[1])[comp]) / 2
+                for comp in (0, 1)
+            )
+            axis_end = tuple(
+                (get(wall.corners[2])[comp] + get(wall.corners[3])[comp]) / 2
+                for comp in (0, 1)
+            )
+            dx = axis_end[0] - axis_start[0]
+            dy = axis_end[1] - axis_start[1]
+            wall_length = math.hypot(dx, dy)
+            opening_key = f"@{opening.id}"
+            if start < 0:
+                rows.append((-start, [(f"{opening_key}:start", 0, -1.0)]))
+            if length < 0.001:
+                rows.append((0.001 - length, [(f"{opening_key}:length", 0, -1.0)]))
+            if start + length > wall_length and wall_length > 1e-9:
+                ux, uy = dx / wall_length, dy / wall_length
+                derivs = [
+                    (f"{opening_key}:start", 0, 1.0),
+                    (f"{opening_key}:length", 0, 1.0),
+                ]
+                for pid in wall.corners[:2]:
+                    derivs.extend([
+                        (pid, 0, ux / 2),
+                        (pid, 1, uy / 2),
+                    ])
+                for pid in wall.corners[2:]:
+                    derivs.extend([
+                        (pid, 0, -ux / 2),
+                        (pid, 1, -uy / 2),
+                    ])
+                rows.append((start + length - wall_length, derivs))
         # user constraints
         for c in doc.constraints.values():
             if isinstance(c, Coincident):
@@ -207,25 +334,44 @@ def solve_document(
                     rows.extend(_coincident_rows(get(c.a), get(c.b), c.a, c.b))
             elif isinstance(c, Distance):
                 ra, rb = c.a, c.b
-                if ra["kind"] == "vertex" and rb["kind"] == "vertex":
-                    if ra["pid"] in doc.points and rb["pid"] in doc.points:
-                        rows.extend(_distance_rows(
-                            get(ra["pid"]), get(rb["pid"]), ra["pid"], rb["pid"], c.length))
+                if ra["kind"] != "edge" and rb["kind"] != "edge":
+                    pos_a = _ref_position(doc, ra, get, get_station)
+                    pos_b = _ref_position(doc, rb, get, get_station)
+                    if pos_a is not None and pos_b is not None:
+                        if ra["kind"] == "opening-length":
+                            opening = doc.openings[ra["opening"]]
+                            idx = opening_index[opening.id]
+                            rows.append((
+                                float(coords[2 * idx + 1]) - c.length,
+                                [(f"@{opening.id}:length", 0, 1.0)],
+                            ))
+                        elif rb["kind"] == "opening-length":
+                            opening = doc.openings[rb["opening"]]
+                            idx = opening_index[opening.id]
+                            rows.append((
+                                float(coords[2 * idx + 1]) - c.length,
+                                [(f"@{opening.id}:length", 0, 1.0)],
+                            ))
+                        else:
+                            rows.extend(_distance_point_rows(
+                                pos_a[0], pos_b[0], pos_a[1], pos_b[1], c.length
+                            ))
                 elif ra["kind"] == "edge":
                     ep = _edge_pids(doc, ra)
-                    if ep is None:
+                    target = _ref_position(doc, rb, get, get_station)
+                    if ep is None or target is None:
                         continue
-                    p_pid = rb["pid"] if rb["kind"] == "vertex" else None
-                    if p_pid is None and rb["kind"] == "edge":
-                        ep2 = _edge_pids(doc, rb)
-                        if ep2 is None:
-                            continue
-                        p_pid = ep2[0]
-                    if p_pid is not None and ep[0] in doc.points and ep[1] in doc.points:
+                    if ep[0] in doc.points and ep[1] in doc.points:
                         off = c.offset if c.offset is not None else 0.0
                         rows.extend(_point_edge_rows(
-                            get(p_pid), get(ep[0]), get(ep[1]),
-                            p_pid, ep[0], ep[1], off))
+                            target[0],
+                            get(ep[0]),
+                            get(ep[1]),
+                            target[1],
+                            ep[0],
+                            ep[1],
+                            off,
+                        ))
             elif isinstance(c, AngleBetween):
                 wa = doc.walls.get(c.wall_a)
                 wb = doc.walls.get(c.wall_b)
@@ -251,7 +397,12 @@ def solve_document(
             r[k] = res
             if want_jac:
                 for pid, comp, val in derivs:
-                    i = index.get(pid)
+                    if pid.startswith("@"):
+                        opening_id, field = pid[1:].split(":", 1)
+                        i = opening_index.get(opening_id)
+                        comp = 0 if field == "start" else 1
+                    else:
+                        i = point_index.get(pid)
                     if i is not None:
                         J[k, 2 * i + comp] += val
         return r, J
@@ -263,8 +414,12 @@ def solve_document(
 
     x = np.empty(n)
     for p in free:
-        x[2 * index[p.id]] = p.x
-        x[2 * index[p.id] + 1] = p.y
+        x[2 * point_index[p.id]] = p.x
+        x[2 * point_index[p.id] + 1] = p.y
+    for oid, opening in doc.openings.items():
+        i = opening_index[oid]
+        x[2 * i] = opening.start
+        x[2 * i + 1] = opening.length
 
     lam = 1e-3
     iterations = 0
@@ -303,8 +458,12 @@ def solve_document(
             break
 
     for p in free:
-        p.x = float(x[2 * index[p.id]])
-        p.y = float(x[2 * index[p.id] + 1])
+        p.x = float(x[2 * point_index[p.id]])
+        p.y = float(x[2 * point_index[p.id] + 1])
+    for oid in doc.openings:
+        i = opening_index[oid]
+        doc.openings[oid].start = float(x[2 * i])
+        doc.openings[oid].length = float(x[2 * i + 1])
 
     max_res = float(np.max(np.abs(r))) if r.size else 0.0
     if J.size:

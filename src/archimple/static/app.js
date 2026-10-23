@@ -15,7 +15,7 @@ const dialogLabel = document.getElementById("dialog-label");
 const dialogInput = document.getElementById("dialog-input");
 
 /* ---------- state ---------- */
-let state = { points: {}, walls: [], constraints: [], status: null };
+let state = { points: {}, walls: [], openings: [], constraints: [], status: null };
 let wallsById = {};
 let constraintsById = {};
 let wallThickness = 0.2;  // default wall thickness from the toolbar field, metres
@@ -125,6 +125,44 @@ function axisDir(w) {
   return { x: a.bx - a.ax, y: a.by - a.ay };
 }
 
+function openingEnds(opening) {
+  const wall = wallsById[opening.wall];
+  if (!wall || !hasCorners(wall)) return null;
+  const axis = wallAxis(wall);
+  const dx = axis.bx - axis.ax, dy = axis.by - axis.ay;
+  const length = Math.hypot(dx, dy);
+  if (length < 1e-9) return null;
+  const ux = dx / length, uy = dy / length;
+  return [
+    { x: axis.ax + ux * opening.start, y: axis.ay + uy * opening.start },
+    {
+      x: axis.ax + ux * (opening.start + opening.length),
+      y: axis.ay + uy * (opening.start + opening.length),
+    },
+  ];
+}
+
+function projectOpening(w, wall) {
+  const axis = wallAxis(wall);
+  const dx = axis.bx - axis.ax, dy = axis.by - axis.ay;
+  const length = Math.hypot(dx, dy);
+  if (length < 1e-9) return null;
+  const ux = dx / length, uy = dy / length;
+  return Math.max(0, Math.min(length, (w.x - axis.ax) * ux + (w.y - axis.ay) * uy));
+}
+
+function pickOpening(w) {
+  let best = null, bestD = 8;
+  for (const opening of state.openings || []) {
+    const ends = openingEnds(opening);
+    if (!ends) continue;
+    const a = toScreen(ends[0].x, ends[0].y), b = toScreen(ends[1].x, ends[1].y);
+    const d = distToSegScreen(w.x * view.scale + view.ox, view.oy - w.y * view.scale, a, b);
+    if (d < bestD) { best = opening; bestD = d; }
+  }
+  return best;
+}
+
 function edgePts(w, side) {
   const c = corners(w);
   return side > 0 ? [c[0], c[3]] : [c[1], c[2]];
@@ -205,6 +243,48 @@ function pickWall(w) {
 }
 
 function pickTarget(w) {
+  const sx = w.x * view.scale + view.ox, sy = view.oy - w.y * view.scale;
+  for (const wall of state.walls) {
+    if (!hasCorners(wall)) continue;
+    const axis = wallAxis(wall);
+    for (const [index, end] of [
+      { x: axis.ax, y: axis.ay },
+      { x: axis.bx, y: axis.by },
+    ].entries()) {
+      const screen = toScreen(end.x, end.y);
+      if (Math.hypot(sx - screen.x, sy - screen.y) < 9) {
+        return {
+          kind: "wall-end",
+          wall: wall.id,
+          end: index === 0 ? "start" : "end",
+        };
+      }
+    }
+  }
+  for (const opening of state.openings || []) {
+    const ends = openingEnds(opening);
+    if (!ends) continue;
+    for (const [index, end] of ends.entries()) {
+      const screen = toScreen(end.x, end.y);
+      if (Math.hypot(sx - screen.x, sy - screen.y) < 10) {
+        return {
+          kind: "opening",
+          opening: opening.id,
+          handle: index === 0 ? "start" : "end",
+        };
+      }
+    }
+    const a = toScreen(ends[0].x, ends[0].y), b = toScreen(ends[1].x, ends[1].y);
+    if (distToSegScreen(sx, sy, a, b) < 8) {
+      const firstDistance = Math.hypot(sx - a.x, sy - a.y);
+      const secondDistance = Math.hypot(sx - b.x, sy - b.y);
+      return {
+        kind: "opening",
+        opening: opening.id,
+        handle: firstDistance < secondDistance ? "start" : "end",
+      };
+    }
+  }
   const p = pickPoint(w);
   if (p) return { kind: "vertex", pid: p.id };
   for (const wall of state.walls) {
@@ -220,9 +300,22 @@ function pickTarget(w) {
 }
 
 function targetPos(t) {
+  if (t.kind === "wall-end") {
+    const wall = wallsById[t.wall];
+    if (!wall || !hasCorners(wall)) return null;
+    const axis = wallAxis(wall);
+    return t.end === "start"
+      ? { x: axis.ax, y: axis.ay }
+      : { x: axis.bx, y: axis.by };
+  }
   if (t.kind === "vertex") {
     const p = pt(t.pid);
     return p ? { x: p.x, y: p.y } : null;
+  }
+  if (t.kind === "opening") {
+    const opening = (state.openings || []).find(item => item.id === t.opening);
+    const ends = opening && openingEnds(opening);
+    return ends ? ends[t.handle === "start" ? 0 : 1] : null;
   }
   const w = wallsById[t.wall];
   if (!w || !hasCorners(w)) return null;
@@ -231,16 +324,79 @@ function targetPos(t) {
 }
 
 function refOf(t) {
-  return t.kind === "vertex"
-    ? { kind: "vertex", pid: t.pid }
-    : { kind: "edge", wall: t.wall, side: t.side };
+  if (t.kind === "wall-end") return { kind: "wall-end", wall: t.wall, end: t.end };
+  if (t.kind === "vertex") return { kind: "vertex", pid: t.pid };
+  if (t.kind === "opening") return { kind: "opening", opening: t.opening, handle: t.handle };
+  if (t.kind === "opening-length") {
+    return { kind: "opening-length", opening: t.opening };
+  }
+  return { kind: "edge", wall: t.wall, side: t.side };
 }
 
 /* measure segment for a distance constraint: [from, to] world points */
+function openingLengthRefs(c) {
+  const refs = [c.a, c.b];
+  const openingRefs = refs.filter(ref => ref.kind === "opening");
+  if (openingRefs.length === 2
+      && openingRefs[0].opening === openingRefs[1].opening
+      && openingRefs[0].handle !== openingRefs[1].handle) {
+    return { opening: openingRefs[0].opening };
+  }
+  const lengthRef = refs.find(ref => ref.kind === "opening-length");
+  return lengthRef ? { opening: lengthRef.opening } : null;
+}
+
 function distMeasureWorld(c) {
   const ra = c.a, rb = c.b;
-  if (ra.kind === "vertex" && rb.kind === "vertex") {
-    const p1 = pt(ra.pid), p2 = pt(rb.pid);
+  const lengthRef = openingLengthRefs(c);
+  if (lengthRef) {
+    const opening = (state.openings || []).find(item => item.id === lengthRef.opening);
+    const ends = opening && openingEnds(opening);
+    if (!ends) return null;
+    const wall = wallsById[opening.wall];
+    const axis = wall && hasCorners(wall) ? wallAxis(wall) : null;
+    if (!axis) return null;
+    const dx = axis.bx - axis.ax, dy = axis.by - axis.ay;
+    const size = Math.hypot(dx, dy) || 1;
+    const ux = dx / size, uy = dy / size;
+    const nx = uy, ny = -ux;
+    const offset = 0.16;
+    const side = (
+      (c.a.kind === "opening" && c.a.handle === "start")
+      || (c.b.kind === "opening" && c.b.handle === "start")
+    ) ? -1 : 1;
+    return ends.map(end => ({
+      x: end.x + nx * offset * side,
+      y: end.y + ny * offset * side,
+    }));
+  }
+  if (
+    (ra.kind === "opening" && rb.kind === "wall-end")
+    || (rb.kind === "opening" && ra.kind === "wall-end")
+  ) {
+    const openingRef = ra.kind === "opening" ? ra : rb;
+    const wallEndRef = ra.kind === "wall-end" ? ra : rb;
+    const opening = (state.openings || []).find(item => item.id === openingRef.opening);
+    const ends = opening && openingEnds(opening);
+    const wall = wallsById[wallEndRef.wall];
+    if (!ends || !wall || !hasCorners(wall)) return null;
+    const axis = wallAxis(wall);
+    const end = wallEndRef.end === "start"
+      ? { x: axis.ax, y: axis.ay }
+      : { x: axis.bx, y: axis.by };
+    return [ends[openingRef.handle === "start" ? 0 : 1], end];
+  }
+  if (
+    ra.kind === "wall-end" && rb.kind === "wall-end"
+    && ra.wall === rb.wall && ra.end !== rb.end
+  ) {
+    const wall = wallsById[ra.wall];
+    if (!wall || !hasCorners(wall)) return null;
+    const axis = wallAxis(wall);
+    return [{ x: axis.ax, y: axis.ay }, { x: axis.bx, y: axis.by }];
+  }
+  if (ra.kind !== "edge" && rb.kind !== "edge") {
+    const p1 = targetPos(ra), p2 = targetPos(rb);
     if (!p1 || !p2) return null;
     return [p1, p2];
   }
@@ -251,14 +407,7 @@ function distMeasureWorld(c) {
   const u = edgeUnit(w, eRef.side);
   if (!u) return null;
   const [P] = edgePts(w, eRef.side);
-  let p;
-  if (pRef.kind === "vertex") {
-    p = pt(pRef.pid);
-  } else {
-    const w2 = wallsById[pRef.wall];
-    if (!w2 || !hasCorners(w2)) return null;
-    p = edgePts(w2, pRef.side)[0];
-  }
+  const p = targetPos(pRef);
   if (!p) return null;
   const nx = -u.y, ny = u.x;
   const D = (p.x - P.x) * nx + (p.y - P.y) * ny;
@@ -290,16 +439,40 @@ function angleGeometry(c) {
   return { anchor: anchorS, label, t1, delta, parallel: Math.abs(cross) < 1e-9 };
 }
 
+function distanceLabelPoint(c, a, b) {
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const length = Math.hypot(dx, dy) || 1;
+  if (openingLengthRefs(c)) {
+    return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+  }
+  return {
+    x: (a.x + b.x) / 2 - dy / length * 14,
+    y: (a.y + b.y) / 2 + dx / length * 14,
+  };
+}
+
+function badgeLeftOfLabel(point, text) {
+  ctx.font = "12px ui-monospace, monospace";
+  const halfWidth = ctx.measureText(text).width / 2 + 5;
+  return { x: point.x - halfWidth - 12, y: point.y };
+}
+
+function distanceBadgePoint(c, a, b) {
+  return badgeLeftOfLabel(distanceLabelPoint(c, a, b), fmtLen(c.length));
+}
+
 function constraintAnchor(c) {
   if (c.type === "distance") {
     const seg = distMeasureWorld(c);
     if (!seg) return null;
     const s1 = toScreen(seg[0].x, seg[0].y), s2 = toScreen(seg[1].x, seg[1].y);
-    return { x: (s1.x + s2.x) / 2, y: (s1.y + s2.y) / 2 };
+    const dx = s2.x - s1.x, dy = s2.y - s1.y;
+    const length = Math.hypot(dx, dy) || 1;
+    return distanceBadgePoint(c, s1, s2);
   }
   if (c.type === "angle") {
     const g = angleGeometry(c);
-    return g ? g.label : null;
+    return g ? badgeLeftOfLabel(g.label, fmtDeg(Math.abs(c.degrees))) : null;
   }
   if (c.type === "coincident") {
     const p = pt(c.a);
@@ -331,10 +504,23 @@ function pickConstraint(w) {
       if (seg) {
         const s1 = toScreen(seg[0].x, seg[0].y), s2 = toScreen(seg[1].x, seg[1].y);
         d = distToSegScreen(sx, sy, s1, s2);
+        const text = fmtLen(c.length);
+        ctx.font = "12px ui-monospace, monospace";
+        const halfWidth = ctx.measureText(text).width / 2 + 6;
+        const labelPoint = distanceLabelPoint(c, s1, s2);
+        if (Math.abs(sx - labelPoint.x) <= halfWidth && Math.abs(sy - labelPoint.y) <= 10) {
+          d = 0;
+        }
       }
     } else if (c.type === "angle") {
       const g = angleGeometry(c);
-      if (g) d = Math.hypot(sx - g.label.x, sy - g.label.y);
+      if (g) {
+        const badge = badgeLeftOfLabel(g.label, fmtDeg(Math.abs(c.degrees)));
+        d = Math.min(
+          Math.hypot(sx - g.label.x, sy - g.label.y),
+          Math.hypot(sx - badge.x, sy - badge.y),
+        );
+      }
     } else if (c.type === "coincident") {
       for (const pid of [c.a, c.b]) {
         const p = pt(pid);
@@ -432,6 +618,7 @@ function draw() {
     }
     for (const c of state.constraints) drawBadge(c);
   }
+  drawOpenings();
   drawPreview();
   drawHover();
 }
@@ -497,6 +684,32 @@ function drawWalls() {
   }
 }
 
+function drawOpenings() {
+  for (const opening of state.openings || []) {
+    const ends = openingEnds(opening);
+    if (!ends) continue;
+    const selected = selection?.kind === "opening" && selection.id === opening.id;
+    const hovered = hover?.kind === "opening" && hover.id === opening.id;
+    ctx.strokeStyle = selected ? "#ffb454" : hovered ? "#6cd0ff" : "#f0c674";
+    ctx.lineWidth = selected ? 5 : 4;
+    const start = toScreen(ends[0].x, ends[0].y), end = toScreen(ends[1].x, ends[1].y);
+    line2(start, end);
+    const hasLengthDimension = state.constraints.some(c => openingLengthRefs(c)?.opening === opening.id);
+    if (!hasLengthDimension) {
+      label((start.x + end.x) / 2, (start.y + end.y) / 2 - 12, fmtLen(opening.length), "#f0c674");
+    }
+    if (selected) {
+      ctx.fillStyle = "#ffb454";
+      for (const end of ends) {
+        const p = toScreen(end.x, end.y);
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  }
+}
+
 function arrowHead(from, to, col) {
   const ang = Math.atan2(to.y - from.y, to.x - from.x);
   ctx.beginPath();
@@ -516,13 +729,30 @@ function drawDistance(c) {
   const col = sel ? "#ffb454" : "#6cd0ff";
   ctx.strokeStyle = col;
   ctx.lineWidth = 1.5;
+  const lengthRef = openingLengthRefs(c);
+  if (lengthRef) {
+    const opening = (state.openings || []).find(item => item.id === lengthRef.opening);
+    const ends = opening && openingEnds(opening);
+    const host = opening && wallsById[opening.wall];
+    const dimensionEnds = distMeasureWorld(c);
+    if (ends && dimensionEnds && host && hasCorners(host)) {
+      for (let i = 0; i < 2; i++) {
+        const source = toScreen(ends[i].x, ends[i].y);
+        const offset = toScreen(dimensionEnds[i].x, dimensionEnds[i].y);
+        ctx.strokeStyle = col;
+        ctx.lineWidth = 1;
+        ctx.setLineDash([3, 3]);
+        line2(source, offset);
+        ctx.setLineDash([]);
+      }
+    }
+  }
   line2(s1, s2);
   arrowHead(s1, s2, col);
   arrowHead(s2, s1, col);
   const mx = (s1.x + s2.x) / 2, my = (s1.y + s2.y) / 2;
-  const dx = s2.x - s1.x, dy = s2.y - s1.y;
-  const L = Math.hypot(dx, dy) || 1;
-  label(mx - (dy / L) * 14, my + (dx / L) * 14, fmtLen(c.length), col);
+  const labelPoint = distanceLabelPoint(c, s1, s2);
+  label(labelPoint.x, labelPoint.y, fmtLen(c.length), col);
 }
 
 function drawAngle(c) {
@@ -622,6 +852,35 @@ function roundRect(x, y, w, h, r) {
 }
 
 function drawPreview() {
+  if ((tool === "dim" || tool === "coincident") && mouse.inside) {
+    const target = pickTarget({ x: mouse.wx, y: mouse.wy });
+    if (target && target.kind === "vertex") {
+      const point = targetPos(target);
+      if (point) {
+        const screen = toScreen(point.x, point.y);
+        ctx.beginPath();
+        ctx.arc(screen.x, screen.y, 8, 0, Math.PI * 2);
+        ctx.strokeStyle = tool === "dim" ? "rgba(108,208,255,0.9)" : "rgba(167,139,250,0.9)";
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      }
+    }
+  }
+  if (tool === "opening" && pending.length === 1 && mouse.inside) {
+    const wall = wallsById[pending[0].wall];
+    if (!wall || !hasCorners(wall)) return;
+    const end = projectOpening({ x: mouse.wx, y: mouse.wy }, wall);
+    if (end == null || Math.abs(end - pending[0].station) < 0.01) return;
+    const axis = wallAxis(wall);
+    const dir = axisDir(wall);
+    const length = Math.hypot(dir.x, dir.y);
+    const ux = dir.x / length, uy = dir.y / length;
+    const a = toScreen(axis.ax + ux * pending[0].station, axis.ay + uy * pending[0].station);
+    const b = toScreen(axis.ax + ux * end, axis.ay + uy * end);
+    ctx.strokeStyle = "rgba(240,198,116,0.8)";
+    ctx.lineWidth = 4;
+    line2(a, b);
+  }
   if (tool === "wall" && pending.length === 1 && mouse.inside) {
     const s = snapWorld({ x: mouse.wx, y: mouse.wy });
     const a = pending[0];
@@ -680,7 +939,25 @@ function drawPreview() {
 
 function drawHover() {
   if (!hover) return;
-  if (hover.kind === "point") {
+  if (hover.kind === "opening-handle") {
+    const [openingId, handle] = hover.id.split(":");
+    const opening = (state.openings || []).find(item => item.id === openingId);
+    const ends = opening && openingEnds(opening);
+    if (!ends) return;
+    const p = toScreen(ends[handle === "start" ? 0 : 1].x, ends[handle === "start" ? 0 : 1].y);
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 8, 0, Math.PI * 2);
+    ctx.strokeStyle = "#6cd0ff";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  } else if (hover.kind === "opening-length") {
+    const opening = (state.openings || []).find(item => item.id === hover.id);
+    const ends = opening && openingEnds(opening);
+    if (!ends) return;
+    ctx.strokeStyle = "rgba(108,208,255,0.8)";
+    ctx.lineWidth = 6;
+    line2(toScreen(ends[0].x, ends[0].y), toScreen(ends[1].x, ends[1].y));
+  } else if (hover.kind === "point") {
     const p = pt(hover.id);
     if (!p) return;
     const s = toScreen(p.x, p.y);
@@ -700,6 +977,15 @@ function drawHover() {
     for (const c of [cs[1], cs[2], cs[3], cs[0]]) {
       ctx.lineTo(c.x * view.scale + view.ox, view.oy - c.y * view.scale);
     }
+    ctx.stroke();
+  } else if (hover.kind === "wall-end") {
+    const target = targetPos({ kind: "wall-end", wall: hover.wall, end: hover.end });
+    if (!target) return;
+    const point = toScreen(target.x, target.y);
+    ctx.beginPath();
+    ctx.arc(point.x, point.y, 8, 0, Math.PI * 2);
+    ctx.strokeStyle = "#6cd0ff";
+    ctx.lineWidth = 1.5;
     ctx.stroke();
   } else if (hover.kind === "edge") {
     const w = wallsById[hover.wall];
@@ -723,9 +1009,10 @@ function setTool(t) {
 }
 
 const HINTS = {
-  select: "Drag corners or walls · right-drag rotates the selected wall around its center · wheel to zoom · middle-drag to pan",
+  select: "Drag corners or walls · drag opening ends to resize or its middle to move · right-drag rotates walls",
   wall: "Click two axis points; snapping to a corner creates a coincident constraint (Esc cancels)",
-  dim: "Click two targets (corner or wall edge), then enter the distance",
+  opening: "Click two points along a wall axis to create an opening (Esc cancels)",
+  dim: "Click two targets (opening segment or handle, corner, wall edge, or wall axis end)",
   angle: "Click two walls, then enter the angle",
   coincident: "Click two wall corners to make them coincident",
   horizontal: "Click a wall to constrain its axis horizontal",
@@ -750,11 +1037,34 @@ function sendDrag(pointsMap, force) {
 }
 
 function updateHover(w) {
-  const p = pickPoint(w);
-  if (p) { hover = { kind: "point", id: p.id }; }
-  else if (tool === "dim") {
-    const t = pickTarget(w);
-    hover = t && t.kind === "edge" ? { kind: "edge", wall: t.wall, side: t.side } : null;
+  if (tool === "dim") {
+    const target = pickTarget(w);
+    if (!target) hover = null;
+    else if (target.kind === "opening") {
+      hover = { kind: "opening-handle", id: `${target.opening}:${target.handle}` };
+    } else if (target.kind === "opening-length") {
+      hover = { kind: "opening-length", id: target.opening };
+    } else if (target.kind === "wall-end") {
+      hover = { kind: "wall-end", wall: target.wall, end: target.end };
+    } else if (target.kind === "edge") {
+      hover = { kind: "edge", wall: target.wall, side: target.side };
+    } else {
+      hover = { kind: "point", id: target.pid };
+    }
+  } else if (tool === "select") {
+    const opening = pickOpening(w);
+    if (opening) hover = { kind: "opening", id: opening.id };
+    else {
+      const p = pickPoint(w);
+      if (p) hover = { kind: "point", id: p.id };
+      else {
+        const wall = pickWall(w);
+        hover = wall ? { kind: "wall", id: wall.id } : null;
+      }
+    }
+  } else if (tool === "opening") {
+    const wall = pickWall(w);
+    hover = wall ? { kind: "wall", id: wall.id } : null;
   } else {
     const wall = pickWall(w);
     hover = wall ? { kind: "wall", id: wall.id } : null;
@@ -826,10 +1136,44 @@ canvas.addEventListener("pointerdown", (e) => {
   if (e.button !== 0) return;
 
   if (tool === "select") {
+    const opening = pickOpening(w);
+    if (opening) {
+      const wall = wallsById[opening.wall];
+      const ends = openingEnds(opening);
+      const sx = w.x * view.scale + view.ox;
+      const sy = view.oy - w.y * view.scale;
+      const startScreen = toScreen(ends[0].x, ends[0].y);
+      const endScreen = toScreen(ends[1].x, ends[1].y);
+      const startDistance = Math.hypot(sx - startScreen.x, sy - startScreen.y);
+      const endDistance = Math.hypot(sx - endScreen.x, sy - endScreen.y);
+      const endpoint = Math.min(startDistance, endDistance) <= 9
+        ? (startDistance < endDistance ? "start" : "end")
+        : "body";
+      const station = projectOpening(w, wall);
+      drag = {
+        mode: "opening",
+        id: opening.id,
+        endpoint,
+        origStart: opening.start,
+        origLength: opening.length,
+        grabOffset: endpoint === "body" ? station - opening.start : 0,
+      };
+      selection = { kind: "opening", id: opening.id };
+      syncPanel();
+      draw();
+      return;
+    }
     const p = pickPoint(w);
     if (p) {
       drag = { mode: "point", id: p.id };
       selection = null;
+      return;
+    }
+    const constraint = pickConstraint(w);
+    if (constraint) {
+      selection = { kind: "constraint", id: constraint.id };
+      syncPanel();
+      draw();
       return;
     }
     const wall = pickWall(w);
@@ -846,16 +1190,33 @@ canvas.addEventListener("pointerdown", (e) => {
       draw();
       return;
     }
-    const c = pickConstraint(w);
-    if (c) {
-      selection = { kind: "constraint", id: c.id };
-      syncPanel();
-      draw();
-      return;
-    }
     selection = null;
     syncPanel();
     draw();
+    return;
+  }
+
+  if (tool === "opening") {
+    if (!pending.length) {
+      const wall = pickWall(w);
+      if (!wall) { flash("click a wall"); return; }
+      const station = projectOpening(w, wall);
+      pending.push({ wall: wall.id, station });
+      selection = null;
+      draw();
+      return;
+    }
+    const wall = wallsById[pending[0].wall];
+    const end = wall ? projectOpening(w, wall) : null;
+    if (!wall || end == null || Math.abs(end - pending[0].station) < 0.01) {
+      pending = [];
+      flash("opening must have positive length");
+      return;
+    }
+    const start = Math.min(pending[0].station, end);
+    const finish = Math.max(pending[0].station, end);
+    send({ op: "add_opening", wall: wall.id, start, end: finish });
+    pending = [];
     return;
   }
 
@@ -904,12 +1265,22 @@ canvas.addEventListener("pointerdown", (e) => {
 
   if (tool === "dim") {
     const t = pickTarget(w);
-    if (!t) { flash("click a wall corner or edge"); return; }
+    if (!t) { flash("click an opening or opening handle, wall corner, or edge"); return; }
     pending.push(t);
     if (pending.length === 2) {
       const [t1, t2] = pending;
       pending = [];
+      if (t1.kind === "wall-end" && t2.kind === "wall-end"
+          && t1.wall === t2.wall && t1.end === t2.end) {
+        flash("pick two different targets");
+        return;
+      }
       if (t1.kind === "vertex" && t2.kind === "vertex" && t1.pid === t2.pid) {
+        flash("pick two different targets");
+        return;
+      }
+      if (t1.kind === "opening" && t2.kind === "opening"
+          && t1.opening === t2.opening && t1.handle === t2.handle) {
         flash("pick two different targets");
         return;
       }
@@ -919,8 +1290,8 @@ canvas.addEventListener("pointerdown", (e) => {
         return;
       }
       let cur;
-      if (t1.kind === "vertex" && t2.kind === "vertex") {
-        const p1 = pt(t1.pid), p2 = pt(t2.pid);
+      if (t1.kind !== "edge" && t2.kind !== "edge") {
+        const p1 = targetPos(t1), p2 = targetPos(t2);
         cur = Math.hypot(p2.x - p1.x, p2.y - p1.y);
       } else if (t1.kind === "edge" && t2.kind === "edge") {
         const w1 = wallsById[t1.wall], w2 = wallsById[t2.wall];
@@ -934,12 +1305,49 @@ canvas.addEventListener("pointerdown", (e) => {
       } else {
         const ve = t1.kind === "edge" ? t1 : t2;
         const vt = t1.kind === "edge" ? t2 : t1;
-        cur = Math.abs(signedDistPointEdge(pt(vt.pid), wallsById[ve.wall], ve.side));
+        cur = Math.abs(signedDistPointEdge(targetPos(vt), wallsById[ve.wall], ve.side));
       }
       if (cur == null) return;
-      openDialog("Distance", fmtLen(cur), parseLen, (v) => {
-        send({ op: "add_constraint", constraint: { type: "distance", a: refOf(t1), b: refOf(t2), length: v } });
-      });
+      const sameOpening = t1.kind === "opening" && t2.kind === "opening"
+        && t1.opening === t2.opening && t1.handle !== t2.handle;
+      const sameOpeningLengthTarget =
+        (t1.kind === "opening-length" && t2.kind === "opening"
+          && t1.opening === t2.opening)
+        || (t2.kind === "opening-length" && t1.kind === "opening"
+          && t1.opening === t2.opening);
+      const lengthOpeningId = sameOpening ? t1.opening
+        : sameOpeningLengthTarget
+          ? (t1.kind === "opening-length" ? t1.opening : t2.opening)
+          : null;
+      const hasLengthConstraint = lengthOpeningId !== null
+        && state.constraints.some(c => openingLengthRefs(c)?.opening === lengthOpeningId);
+      if (sameOpening && !hasLengthConstraint) {
+        send({ op: "add_constraint", constraint: {
+          type: "distance", a: refOf(t1), b: refOf(t2), length: cur,
+        } });
+        return;
+      }
+      const axisLength = t1.kind === "wall-end" && t2.kind === "wall-end"
+        && t1.wall === t2.wall && t1.end !== t2.end;
+      const dimensionName = sameOpeningLengthTarget || (sameOpening && hasLengthConstraint)
+        ? "Opening length"
+        : axisLength
+          ? "Wall length"
+          : "Distance";
+      if (t1.kind === "opening-length" && t2.kind === "opening-length") {
+        flash("pick a different target");
+        return;
+      }
+      openDialog(
+        dimensionName,
+        fmtLen(cur),
+        parseLen,
+        (v) => {
+          send({ op: "add_constraint", constraint: {
+            type: "distance", a: refOf(t1), b: refOf(t2), length: v,
+          } });
+        },
+      );
     }
     return;
   }
@@ -988,6 +1396,35 @@ canvas.addEventListener("pointermove", (e) => {
   const r = canvas.getBoundingClientRect();
   mouse = { wx: w.x, wy: w.y, sx: e.clientX - r.left, sy: e.clientY - r.top, inside: true };
   coordsEl.textContent = `x: ${fmtLen(w.x)}  y: ${fmtLen(w.y)}`;
+
+  if (drag && drag.mode === "opening") {
+    const opening = (state.openings || []).find(item => item.id === drag.id);
+    const wall = opening && wallsById[opening.wall];
+    const station = wall ? projectOpening(w, wall) : null;
+    if (opening && station != null) {
+      const axis = wallAxis(wall);
+      const direction = axisDir(wall);
+      const wallLength = Math.hypot(direction.x, direction.y);
+      let start = drag.origStart, end = drag.origStart + drag.origLength;
+      if (drag.endpoint === "start") start = Math.max(0, Math.min(end - 0.01, station));
+      else if (drag.endpoint === "end") end = Math.min(wallLength, Math.max(start + 0.01, station));
+      else {
+        start = Math.max(0, Math.min(wallLength - drag.origLength, station - drag.grabOffset));
+        end = start + drag.origLength;
+      }
+      opening.start = start;
+      opening.length = end - start;
+      drag.finalStart = start;
+      drag.finalEnd = end;
+      const now = performance.now();
+      if (now - lastDragSend >= 33) {
+        lastDragSend = now;
+        send({ op: "update_opening", id: opening.id, start, end });
+      }
+      draw();
+    }
+    return;
+  }
 
   if (rotate) {
     const delta = Math.atan2(w.y - rotate.pivot.y, w.x - rotate.pivot.x) - rotate.startAng;
@@ -1065,7 +1502,12 @@ canvas.addEventListener("pointerup", (e) => {
   }
   if (drag) {
     // make sure the server saw the final positions, then trigger a full solve
-    if (drag.mode === "point") {
+    if (drag.mode === "opening") {
+      const opening = (state.openings || []).find(item => item.id === drag.id);
+      if (opening && Number.isFinite(drag.finalStart) && Number.isFinite(drag.finalEnd)) {
+        send({ op: "update_opening", id: opening.id, start: drag.finalStart, end: drag.finalEnd });
+      }
+    } else if (drag.mode === "point") {
       const p = state.points[drag.id];
       if (p) sendDrag({ [drag.id]: [p.x, p.y] }, true);
     } else if (drag.mode === "wall") {
@@ -1120,9 +1562,19 @@ function openDialog(labelText, value, parse, onSubmit) {
 
 function editConstraint(c) {
   if (c.type === "distance") {
-    openDialog("Distance", fmtLen(c.length), parseLen, (value) => {
-      send({ op: "update_constraint", id: c.id, value });
-    });
+    const isOpeningLength = c.a.kind === "opening-length"
+      || c.b.kind === "opening-length"
+      || (c.a.kind === "opening" && c.b.kind === "opening"
+        && c.a.opening === c.b.opening && c.a.handle !== c.b.handle);
+    if (isOpeningLength) {
+      openDialog("Opening length", fmtLen(c.length), parseLen, (value) => {
+        send({ op: "update_constraint", id: c.id, value });
+      });
+    } else {
+      openDialog("Distance", fmtLen(c.length), parseLen, (value) => {
+        send({ op: "update_constraint", id: c.id, value });
+      });
+    }
   } else if (c.type === "angle") {
     openDialog("Angle (degrees)", fmtDeg(Math.abs(c.degrees)), parseAngle, (value) => {
       send({ op: "update_constraint", id: c.id, value });
@@ -1160,6 +1612,19 @@ function pname(pid) {
 
 function refName(r) {
   if (r.kind === "vertex") return pname(r.pid);
+  if (r.kind === "opening") {
+    const opening = (state.openings || []).find(item => item.id === r.opening);
+    const name = opening ? `${opening.name}·` : "?";
+    return `${name}${r.handle}`;
+  }
+  if (r.kind === "opening-length") {
+    const opening = (state.openings || []).find(item => item.id === r.opening);
+    return `${opening ? opening.name : "?"} length`;
+  }
+  if (r.kind === "wall-end") {
+    const wall = wallsById[r.wall];
+    return `${wall ? wall.name : "?"}·${r.end}`;
+  }
   const w = wallsById[r.wall];
   return `${w ? w.name : "?"}·${r.side > 0 ? "+" : "−"}`;
 }
@@ -1236,7 +1701,10 @@ function syncStatus() {
 window.addEventListener("keydown", (e) => {
   if (!dialogEl.hidden) return;
   if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
-  const tools = { s: "select", w: "wall", d: "dim", a: "angle", c: "coincident", h: "horizontal", v: "vertical" };
+  const tools = {
+    s: "select", w: "wall", o: "opening", d: "dim", a: "angle",
+    c: "coincident", h: "horizontal", v: "vertical",
+  };
   const k = e.key.toLowerCase();
   if (tools[k]) { setTool(tools[k]); return; }
   if (e.key === "Escape") {

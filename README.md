@@ -35,8 +35,15 @@ sharing a point, so deleting the constraint frees the walls again.
   dimension between its two long edges, using the value in the toolbar
   **wall** field (`0.2 m`, `20 cm`, `200 mm` all accepted). The live
   length/angle is shown while drawing.
-- **Dimension** — click two targets: a corner **or a wall edge** (they
-  can belong to different walls), then enter the distance. A thickness is
+- **Opening** — click two points along a wall axis to create a thin segment
+  with its own length. In Select mode, drag an endpoint to resize it or drag
+  the segment body to move it along its host wall. Openings follow their wall
+  when it moves or rotates and are removed when the host wall is deleted.
+- **Dimension** — click two targets: an opening segment or handle, corner,
+  wall edge, or wall axis end (they can belong to different walls), then enter
+  the distance. Two handles dimension their opening length or the distance
+  between openings; the opening segment itself can also be picked to constrain
+  its length, and a handle can be dimensioned against a corner or edge. A thickness is
   just a dimension between a wall's two long edges; edge pairs must be
   nearly parallel. Values accept the current unit plus `m`/`cm`/`mm`
   suffixes.
@@ -51,7 +58,7 @@ The **Constraints** checkbox in the header shows/hides all constraint
 annotations on the drawing: dimension lines, angle arcs, coincidence
 rings and a small selectable badge (↔ ∠ ≡ ─ │) for every constraint —
 click a badge or its graphics to select, `Delete` or the panel ✕ to
-remove. Keyboard shortcuts: `S` `W` `D` `A` `C` `H` `V`. Wheel zooms,
+remove. Keyboard shortcuts: `S` `W` `O` `D` `A` `C` `H` `V`. Wheel zooms,
 middle-drag pans. In select mode, **right-drag rotates the selected wall**
 (or the wall under the cursor) around its own center — the cursor angle
 from the center sets the rotation; right-drag on empty space pans
@@ -81,9 +88,9 @@ src/archimple/
 A wall owns four corner points (start+, start−, end−, end+ around its
 axis); the solver adds four hidden rows per wall (parallelogram ×2,
 right angle ×1, thickness floor ×1) so walls always remain rectangles.
-Dimension constraints can reference a vertex (corner point) or an edge
-(a wall side); edge dimensions are signed distances and a wall's
-two long edges give its thickness.
+Dimension constraints can reference a vertex (corner point), an edge
+(a wall side), or an opening handle; edge dimensions are signed distances
+and a wall's two long edges give its thickness.
 
 ## Tests
 

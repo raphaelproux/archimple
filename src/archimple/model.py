@@ -33,6 +33,15 @@ class Wall:
 
 
 @dataclass
+class Opening:
+    id: str
+    name: str
+    wall: str
+    start: float
+    length: float
+
+
+@dataclass
 class Coincident:
     id: str
     name: str
@@ -80,12 +89,28 @@ def _ref_key(ref: dict) -> str:
     return json.dumps(ref, sort_keys=True)
 
 
-def ref_walls(ref: dict) -> set[str]:
-    return {ref["wall"]} if ref["kind"] == "edge" else set()
+def ref_walls(ref: dict, openings: dict[str, Opening] | None = None) -> set[str]:
+    if ref["kind"] in ("edge", "wall-end"):
+        return {ref["wall"]}
+    if (
+        ref["kind"] in ("opening", "opening-length")
+        and openings
+        and ref["opening"] in openings
+    ):
+        return {openings[ref["opening"]].wall}
+    return set()
 
 
 def ref_points(ref: dict) -> set[str]:
     return {ref["pid"]} if ref["kind"] == "vertex" else set()
+
+
+def ref_openings(ref: dict) -> set[str]:
+    return (
+        {ref["opening"]}
+        if ref["kind"] in ("opening", "opening-length")
+        else set()
+    )
 
 
 def _fold_angle(deg: float) -> float:
@@ -101,6 +126,7 @@ def _fold_angle(deg: float) -> float:
 class Document:
     points: dict[str, Point] = field(default_factory=dict)
     walls: dict[str, Wall] = field(default_factory=dict)
+    openings: dict[str, Opening] = field(default_factory=dict)
     constraints: dict[str, Constraint] = field(default_factory=dict)
     _counters: dict[str, int] = field(default_factory=dict, repr=False)
 
@@ -167,6 +193,47 @@ class Document:
             self.add_constraint({"type": "coincident", "a": corners[idx], "b": pid})
         return wall
 
+    def add_opening(self, wall_id: str, start: float, end: float) -> Opening:
+        if wall_id not in self.walls:
+            raise ValueError("opening references an unknown wall")
+        start, end = float(start), float(end)
+        wall = self.walls[wall_id]
+        ax, ay, bx, by = self._axis_endpoints(wall)
+        length = math.hypot(bx - ax, by - ay)
+        if not (0 <= start < end <= length):
+            raise ValueError(
+                "opening endpoints must lie within the wall and have positive length"
+            )
+        oid, name = self._next("o")
+        opening = Opening(oid, name, wall_id, start, end - start)
+        self.openings[oid] = opening
+        return opening
+
+    def update_opening(self, opening_id: str, start: float, end: float) -> None:
+        opening = self.openings[opening_id]
+        start, end = float(start), float(end)
+        wall = self.walls[opening.wall]
+        ax, ay, bx, by = self._axis_endpoints(wall)
+        length = math.hypot(bx - ax, by - ay)
+        if not (0 <= start < end <= length):
+            raise ValueError(
+                "opening endpoints must lie within the wall and have positive length"
+            )
+        opening.start, opening.length = start, end - start
+
+    def _wall_length(self, wall_id: str) -> float:
+        ax, ay, bx, by = self._axis_endpoints(self.walls[wall_id])
+        return math.hypot(bx - ax, by - ay)
+
+    def _axis_endpoints(self, wall: Wall) -> tuple[float, float, float, float]:
+        c0, c1, c2, c3 = (self.points[pid] for pid in wall.corners)
+        return (
+            (c0.x + c1.x) / 2,
+            (c0.y + c1.y) / 2,
+            (c2.x + c3.x) / 2,
+            (c2.y + c3.y) / 2,
+        )
+
     def move_point(self, pid: str, x: float, y: float) -> None:
         pt = self.points[pid]  # KeyError -> client error message
         pt.x = float(x)
@@ -175,22 +242,68 @@ class Document:
     # -- constraint references --------------------------------------------
 
     def _validate_ref(self, ref: object) -> None:
-        if not isinstance(ref, dict) or ref.get("kind") not in ("vertex", "edge"):
+        if not isinstance(ref, dict) or ref.get("kind") not in (
+            "vertex", "edge", "opening", "opening-length", "wall-end"
+        ):
             raise ValueError("invalid constraint reference")
         if ref["kind"] == "vertex":
             if ref.get("pid") not in self.points:
                 raise ValueError("reference to an unknown point")
-        else:
+        elif ref["kind"] == "edge":
             if ref.get("wall") not in self.walls:
                 raise ValueError("reference to an unknown wall")
             if ref.get("side") not in (1, -1):
                 raise ValueError("invalid edge side")
+        elif ref["kind"] == "wall-end":
+            if (
+                ref.get("wall") not in self.walls
+                or ref.get("end") not in ("start", "end")
+            ):
+                raise ValueError("invalid wall endpoint reference")
+        elif ref["kind"] == "opening":
+            if (
+                ref.get("opening") not in self.openings
+                or ref.get("handle") not in ("start", "end")
+            ):
+                raise ValueError("invalid opening handle reference")
+        elif ref.get("opening") not in self.openings:
+            raise ValueError("invalid opening length reference")
 
     def _edge_frame(self, ref: dict) -> tuple[Point, Point]:
         """First and second corner of an edge ref, as (P, Q) points."""
         w = self.walls[ref["wall"]]
         i = 0 if ref["side"] > 0 else 1
         return self.points[w.corners[i]], self.points[w.corners[3 if ref["side"] > 0 else 2]]
+
+    def _opening_handle_pos(self, ref: dict) -> tuple[float, float]:
+        opening = self.openings[ref["opening"]]
+        wall = self.walls[opening.wall]
+        ax, ay, bx, by = self._axis_endpoints(wall)
+        dx, dy = bx - ax, by - ay
+        wall_length = math.hypot(dx, dy)
+        station = (
+            opening.start
+            if ref["handle"] == "start"
+            else opening.start + opening.length
+        )
+        if wall_length < 1e-9:
+            return ax, ay
+        return ax + station * dx / wall_length, ay + station * dy / wall_length
+
+    def _ref_pos(self, ref: dict) -> tuple[float, float]:
+        if ref["kind"] == "vertex":
+            point = self.points[ref["pid"]]
+            return point.x, point.y
+        if ref["kind"] == "wall-end":
+            ax, ay, bx, by = self._axis_endpoints(self.walls[ref["wall"]])
+            return (ax, ay) if ref["end"] == "start" else (bx, by)
+        if ref["kind"] == "opening":
+            return self._opening_handle_pos(ref)
+        if ref["kind"] == "opening-length":
+            opening = self.openings[ref["opening"]]
+            return opening.length, 0.0
+        point, _ = self._edge_frame(ref)
+        return point.x, point.y
 
     def _signed_edge_distance(self, ea: dict, eb: dict) -> float:
         """Signed distance from edge ea's line to the target of eb."""
@@ -200,11 +313,8 @@ class Document:
         if m < 1e-9:
             return 0.0
         nx, ny = -dy / m, dx / m
-        if eb["kind"] == "vertex":
-            target = self.points[eb["pid"]]
-        else:
-            target, _ = self._edge_frame(eb)
-        return (target.x - p.x) * nx + (target.y - p.y) * ny
+        tx, ty = self._ref_pos(eb)
+        return (tx - p.x) * nx + (ty - p.y) * ny
 
     def _check_edges_parallel(self, ea: dict, eb: dict) -> None:
         p1, q1 = self._edge_frame(ea)
@@ -245,25 +355,44 @@ class Document:
             value = float(data["length"])
             if value <= 0:
                 raise ValueError("distance must be positive")
-            if ra["kind"] == "vertex" and rb["kind"] == "vertex":
-                pa, pb = sorted((ra["pid"], rb["pid"]))
-                if pa == pb:
-                    raise ValueError("cannot dimension a point against itself")
+            point_kinds = ("vertex", "opening", "opening-length", "wall-end")
+            if ra["kind"] in point_kinds and rb["kind"] in point_kinds:
+                if (
+                    ra["kind"] == rb["kind"] == "opening-length"
+                    and ra["opening"] == rb["opening"]
+                ):
+                    raise ValueError(
+                        "cannot dimension an opening length against itself"
+                    )
+                if _ref_key(ra) == _ref_key(rb):
+                    raise ValueError("cannot dimension a target against itself")
+                refs = sorted((ra, rb), key=_ref_key)
+                keys = tuple(_ref_key(ref) for ref in refs)
                 for c in self.constraints.values():
-                    if (
-                        isinstance(c, Distance)
-                        and c.offset is None
-                        and (c.a["pid"], c.b["pid"]) == (pa, pb)
-                    ):
-                        c.length = value
-                        return c, False
+                    if isinstance(c, Distance) and c.offset is None:
+                        if tuple(_ref_key(ref) for ref in (c.a, c.b)) == keys:
+                            if (
+                                c.a["kind"] == "opening-length"
+                                or c.b["kind"] == "opening-length"
+                            ):
+                                ref = c.a if c.a["kind"] == "opening-length" else c.b
+                                opening = self.openings[ref["opening"]]
+                                if value > self._wall_length(opening.wall):
+                                    raise ValueError(
+                                        "opening length cannot exceed its host wall"
+                                    )
+                                opening.length = value
+                            elif self._opening_length_ref_pair(c.a, c.b):
+                                opening = self.openings[c.a["opening"]]
+                                if opening.start + value > self._wall_length(opening.wall):
+                                    raise ValueError(
+                                        "opening length cannot exceed its host wall"
+                                    )
+                                opening.length = value
+                            c.length = value
+                            return c, False
                 cid, name = self._next("d")
-                c = Distance(
-                    cid, name,
-                    {"kind": "vertex", "pid": pa},
-                    {"kind": "vertex", "pid": pb},
-                    value, None,
-                )
+                c = Distance(cid, name, refs[0], refs[1], value, None)
             else:
                 if ra["kind"] == "edge" and rb["kind"] == "edge":
                     if ra["wall"] == rb["wall"] and ra["side"] == rb["side"]:
@@ -331,11 +460,33 @@ class Document:
         self.constraints[c.id] = c
         return c, True
 
+    def _opening_length_ref_pair(self, a: dict, b: dict) -> bool:
+        return (
+            a.get("kind") == b.get("kind") == "opening"
+            and a.get("opening") == b.get("opening")
+            and {a.get("handle"), b.get("handle")} == {"start", "end"}
+        )
+
     def update_constraint(self, cid: str, value: float) -> None:
         c = self.constraints[cid]  # KeyError -> client error message
         if isinstance(c, Distance):
             if value <= 0:
                 raise ValueError("distance must be positive")
+            if c.a["kind"] == "opening-length" or c.b["kind"] == "opening-length":
+                ref = c.a if c.a["kind"] == "opening-length" else c.b
+                opening = self.openings[ref["opening"]]
+                if value > self._wall_length(opening.wall):
+                    raise ValueError(
+                        "opening length cannot exceed its host wall"
+                    )
+                opening.length = value
+            elif self._opening_length_ref_pair(c.a, c.b):
+                opening = self.openings[c.a["opening"]]
+                end = opening.start + value
+                ax, ay, bx, by = self._axis_endpoints(self.walls[opening.wall])
+                if end > math.hypot(bx - ax, by - ay):
+                    raise ValueError("opening length cannot exceed its host wall")
+                opening.length = value
             c.length = value
             if c.offset is not None:
                 sign = -1.0 if c.offset < 0 else 1.0
@@ -354,7 +505,7 @@ class Document:
         if isinstance(c, (Horizontal, Vertical)):
             return {c.wall}
         if isinstance(c, Distance):
-            return ref_walls(c.a) | ref_walls(c.b)
+            return ref_walls(c.a, self.openings) | ref_walls(c.b, self.openings)
         return set()
 
     def _constraint_points(self, c: Constraint) -> set[str]:
@@ -364,10 +515,34 @@ class Document:
             return ref_points(c.a) | ref_points(c.b)
         return set()
 
+    def _constraint_openings(self, c: Constraint) -> set[str]:
+        if isinstance(c, Distance):
+            return ref_openings(c.a) | ref_openings(c.b)
+        return set()
+
     def delete(self, item_id: str) -> bool:
+        if item_id in self.openings:
+            del self.openings[item_id]
+            for cid, constraint in list(self.constraints.items()):
+                if item_id in self._constraint_openings(constraint):
+                    del self.constraints[cid]
+            return True
         if item_id in self.walls:
             del self.walls[item_id]
-            for cid in [cid for cid, c in self.constraints.items() if item_id in self._constraint_walls(c)]:
+            removed_openings = {
+                oid for oid, opening in self.openings.items() if opening.wall == item_id
+            }
+            self.openings = {
+                oid: opening
+                for oid, opening in self.openings.items()
+                if opening.wall != item_id
+            }
+            for cid in [
+                cid
+                for cid, c in self.constraints.items()
+                if item_id in self._constraint_walls(c)
+                or removed_openings & self._constraint_openings(c)
+            ]:
                 del self.constraints[cid]
             # corners belong to their wall: a corner whose wall is gone is
             # removed, together with any constraint that referenced it
@@ -396,6 +571,16 @@ class Document:
             "walls": [
                 {"id": w.id, "name": w.name, "corners": list(w.corners)}
                 for w in self.walls.values()
+            ],
+            "openings": [
+                {
+                    "id": opening.id,
+                    "name": opening.name,
+                    "wall": opening.wall,
+                    "start": round(opening.start, 6),
+                    "length": round(opening.length, 6),
+                }
+                for opening in self.openings.values()
             ],
             "constraints": [_constraint_dict(c) for c in self.constraints.values()],
         }
