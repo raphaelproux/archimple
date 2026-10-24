@@ -9,13 +9,19 @@ const coordsEl = document.getElementById("coords");
 const solverEl = document.getElementById("solver");
 const connEl = document.getElementById("conn");
 const listEl = document.getElementById("constraint-list");
+const symbolListEl = document.getElementById("symbol-list");
 const statusEl = document.getElementById("status");
 const dialogEl = document.getElementById("dialog");
 const dialogLabel = document.getElementById("dialog-label");
 const dialogInput = document.getElementById("dialog-input");
+const symbolModal = document.getElementById("symbol-modal");
+const symbolLabelInput = document.getElementById("symbol-label");
+const symbolSaveButton = document.getElementById("symbol-save");
+const symbolCancelButton = document.getElementById("symbol-cancel");
+const saveSymbolButton = document.getElementById("save-symbol-btn");
 
 /* ---------- state ---------- */
-let state = { points: {}, walls: [], openings: [], constraints: [], status: null };
+let state = { points: {}, walls: [], openings: [], rectangles: [], symbols: [], constraints: [], status: null };
 let wallsById = {};
 let constraintsById = {};
 let wallThickness = 0.2;  // default wall thickness from the toolbar field, metres
@@ -29,8 +35,11 @@ let pending = [];   // collected clicks for multi-step tools
 let hover = null;   // {kind, id, side?}
 let selection = null; // {kind, id}
 let drag = null;
+let rectangleGesture = null;
+let symbolPlacement = null;
 let rotate = null;
 let pan = null;
+let symbolResizePreview = null;
 let mouse = { wx: 0, wy: 0, sx: 0, sy: 0, inside: false };
 let dpr = window.devicePixelRatio || 1;
 
@@ -52,10 +61,53 @@ function connect() {
     const msg = JSON.parse(ev.data);
     if (msg.points) {
       state = msg;
+      if (symbolResizePreview) {
+        const symbol = state.symbols.find(item => item.id === symbolResizePreview.symbolId);
+        if (symbolResizePreview.released && symbol
+            && Math.abs(symbol.width - symbolResizePreview.width) < 1e-5
+            && Math.abs(symbol.height - symbolResizePreview.height) < 1e-5) {
+          symbolResizePreview = null;
+        } else {
+          const source = state.rectangles.find(item => item.id === symbolResizePreview.sourceId);
+          if (source) source.corners = symbolResizePreview.sourceCorners.map((point, index) => {
+            const pid = source.corners[index];
+            const serverPoint = state.points[pid];
+            if (serverPoint && Math.hypot(serverPoint.x - point.x, serverPoint.y - point.y) < 1e-5) {
+              return pid;
+            }
+            state.points[pid] = { ...serverPoint, x: point.x, y: point.y };
+            return pid;
+          });
+          const instances = new Map();
+          for (const rectangle of state.rectangles) {
+            if (rectangle.symbol !== symbolResizePreview.symbolId) continue;
+            const preview = symbolResizePreview.instances.get(rectangle.id);
+            if (!preview) continue;
+            const points = preview.map((point, index) => {
+              const pid = rectangle.corners[index];
+              state.points[pid] = { ...state.points[pid], id: pid, x: point.x, y: point.y };
+              return { x: point.x, y: point.y };
+            });
+            instances.set(rectangle.id, points);
+          }
+          symbolResizePreview.instances = instances;
+        }
+      }
+      for (const symbol of state.symbols || []) {
+        for (const constraint of symbol.constraints || []) {
+          constraint.shared_symbol = symbol.id;
+        }
+      }
       indexState();
+      if (pendingSymbolSave) {
+        const rectangle = state.rectangles.find(item => item.id === pendingSymbolSave.id);
+        const symbol = state.symbols.find(item => item.id === rectangle?.symbol);
+        if (symbol?.label === pendingSymbolSave.label) pendingSymbolSave = null;
+      }
       syncPanel();
       draw();
     } else if (msg.op === "error") {
+      pendingSymbolSave = null;
       flash(msg.message);
     }
   };
@@ -125,6 +177,23 @@ function axisDir(w) {
   return { x: a.bx - a.ax, y: a.by - a.ay };
 }
 
+function rectanglePoints(rectangle) {
+  if (rectangle.corners.every(corner => typeof corner === "string")) {
+    return rectangle.corners.map(pid => state.points[pid]).filter(Boolean);
+  }
+  return rectangle.corners;
+}
+
+function rectBounds(rectangle) {
+  const points = rectanglePoints(rectangle);
+  return {
+    x1: Math.min(...points.map(p => p.x)),
+    y1: Math.min(...points.map(p => p.y)),
+    x2: Math.max(...points.map(p => p.x)),
+    y2: Math.max(...points.map(p => p.y)),
+  };
+}
+
 function openingEnds(opening) {
   const wall = wallsById[opening.wall];
   if (!wall || !hasCorners(wall)) return null;
@@ -149,6 +218,53 @@ function projectOpening(w, wall) {
   if (length < 1e-9) return null;
   const ux = dx / length, uy = dy / length;
   return Math.max(0, Math.min(length, (w.x - axis.ax) * ux + (w.y - axis.ay) * uy));
+}
+
+function pickWallPathCorner(w) {
+  let best = null, bestDistance = 10 / view.scale;
+  for (const wall of state.walls || []) {
+    if (!hasCorners(wall)) continue;
+    for (const pid of wall.corners) {
+      const p = state.points[pid];
+      const distance = Math.hypot(p.x - w.x, p.y - w.y);
+      if (distance < bestDistance) {
+        best = p;
+        bestDistance = distance;
+      }
+    }
+  }
+  return best;
+}
+
+function pickRectangle(w) {
+  for (const rectangle of state.rectangles || []) {
+    const points = rectangleRenderPoints(rectangle);
+    const screen = toScreen(w.x, w.y);
+    if (points.some((point, index) => {
+      const next = points[(index + 1) % points.length];
+      return distToSegScreen(screen.x, screen.y, toScreen(point.x, point.y), toScreen(next.x, next.y)) <= 8;
+    })) return rectangle;
+    let inside = false;
+    for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+      const a = points[i], b = points[j];
+      if ((a.y > w.y) !== (b.y > w.y)
+          && w.x < (b.x - a.x) * (w.y - a.y) / (b.y - a.y) + a.x) {
+        inside = !inside;
+      }
+    }
+    if (inside) return rectangle;
+  }
+  return null;
+}
+
+function pickRectangleCorner(rectangle, w) {
+  const points = rectangleRenderPoints(rectangle);
+  let nearest = null, distance = 12;
+  points.forEach((point, index) => {
+    const d = Math.hypot((point.x - w.x) * view.scale, (point.y - w.y) * view.scale);
+    if (d < distance) { nearest = index; distance = d; }
+  });
+  return nearest;
 }
 
 function pickOpening(w) {
@@ -212,9 +328,33 @@ function distToSegWorld(p, a, b) {
   return Math.hypot(p.x - a.x - t * dx, p.y - a.y - t * dy);
 }
 
-function currentAngleDeg(w1, w2) {
-  const a = axisDir(w1), b = axisDir(w2);
-  return Math.atan2(a.x * b.y - a.y * b.x, a.x * b.x + a.y * b.y) * 180 / Math.PI;
+function pickConstraintLine(w) {
+  const target = toScreen(w.x, w.y);
+  let best = null, bestDistance = 7;
+  for (const wall of state.walls || []) {
+    if (!hasCorners(wall)) continue;
+    const axis = wallAxis(wall);
+    const points = [
+      { x: axis.ax, y: axis.ay }, { x: axis.bx, y: axis.by },
+    ];
+    const distance = distToSegScreen(target.x, target.y, toScreen(points[0].x, points[0].y), toScreen(points[1].x, points[1].y));
+    if (distance < bestDistance) {
+      best = { kind: "wall", wall: wall.id };
+      bestDistance = distance;
+    }
+  }
+  for (const rectangle of state.rectangles || []) {
+    const points = rectanglePoints(rectangle);
+    for (let i = 0; i < 4; i++) {
+      const a = points[i], b = points[(i + 1) % 4];
+      const distance = distToSegScreen(target.x, target.y, toScreen(a.x, a.y), toScreen(b.x, b.y));
+      if (distance < bestDistance) {
+        best = { kind: "segment", start: rectangle.corners[i], end: rectangle.corners[(i + 1) % 4] };
+        bestDistance = distance;
+      }
+    }
+  }
+  return best;
 }
 
 
@@ -414,10 +554,30 @@ function distMeasureWorld(c) {
   return [p, { x: p.x - D * nx, y: p.y - D * ny }];
 }
 
+function lineRefKey(ref) {
+  return ref.kind === "wall" ? `wall:${ref.wall}` : `segment:${[ref.start, ref.end].sort().join(":")}`;
+}
+
+function linePoints(ref) {
+  if (ref?.kind === "wall") {
+    const wall = wallsById[ref.wall];
+    if (!wall || !hasCorners(wall)) return null;
+    const axis = wallAxis(wall);
+    return [{ x: axis.ax, y: axis.ay }, { x: axis.bx, y: axis.by }];
+  }
+  if (ref?.kind === "segment") {
+    const start = pt(ref.start), end = pt(ref.end);
+    return start && end ? [start, end] : null;
+  }
+  return null;
+}
+
 function angleGeometry(c) {
-  const wa = wallsById[c.wall_a], wb = wallsById[c.wall_b];
-  if (!wa || !wb || !hasCorners(wa) || !hasCorners(wb)) return null;
-  const aa = wallAxis(wa), ab = wallAxis(wb);
+  const [a1, a2] = linePoints(c.a) || [];
+  const [b1, b2] = linePoints(c.b) || [];
+  if (!a1 || !a2 || !b1 || !b2) return null;
+  const aa = { ax: a1.x, ay: a1.y, bx: a2.x, by: a2.y };
+  const ab = { ax: b1.x, ay: b1.y, bx: b2.x, by: b2.y };
   const d1x = aa.bx - aa.ax, d1y = aa.by - aa.ay;
   const d2x = ab.bx - ab.ax, d2y = ab.by - ab.ay;
   const cross = d1x * d2y - d1y * d2x;
@@ -478,10 +638,9 @@ function constraintAnchor(c) {
     const p = pt(c.a);
     return p ? toScreen(p.x, p.y) : null;
   }
-  const w = wallsById[c.wall];
-  if (!w || !hasCorners(w)) return null;
-  const a = wallAxis(w);
-  return toScreen((a.ax + a.bx) / 2, (a.ay + a.by) / 2);
+  const points = linePoints(c.target);
+  if (!points) return null;
+  return toScreen((points[0].x + points[1].x) / 2, (points[0].y + points[1].y) / 2);
 }
 
 function distToSegScreen(px, py, a, b) {
@@ -497,7 +656,7 @@ function pickConstraint(w) {
   if (!showC) return null;
   const sx = w.x * view.scale + view.ox, sy = view.oy - w.y * view.scale;
   let best = null, bestD = 12;
-  for (const c of state.constraints) {
+  for (const c of allVisibleConstraints()) {
     let d = Infinity;
     if (c.type === "distance") {
       const seg = distMeasureWorld(c);
@@ -598,6 +757,108 @@ function gridSteps() {
   return [5, 25];
 }
 
+function rectangleRenderPoints(rectangle) {
+  if (symbolResizePreview?.symbolId === rectangle.symbol) {
+    return symbolResizePreview.instances.get(rectangle.id) || rectanglePoints(rectangle);
+  }
+  return rectanglePoints(rectangle);
+}
+
+function updateSymbolResizePreview(rectangle, corners) {
+  const symbol = state.symbols.find(item => item.id === rectangle?.symbol);
+  if (!symbol) {
+    symbolResizePreview = null;
+    return;
+  }
+  const p0 = corners[0], p1 = corners[1], p3 = corners[3];
+  const width = Math.hypot(p1.x - p0.x, p1.y - p0.y);
+  const height = Math.hypot(p3.x - p0.x, p3.y - p0.y);
+  const instances = new Map();
+  const initialInstances = symbolResizePreview?.symbolId === symbol.id
+    ? symbolResizePreview.initialInstances
+    : new Map(state.rectangles
+      .filter(instance => instance.symbol === symbol.id)
+      .map(instance => [instance.id, rectanglePoints(instance).map(point => ({ x: point.x, y: point.y }))]));
+  for (const instance of state.rectangles) {
+    if (instance.symbol !== symbol.id) continue;
+    if (instance.id === rectangle.id) {
+      instances.set(instance.id, corners);
+      continue;
+    }
+    const points = initialInstances.get(instance.id) || rectanglePoints(instance);
+    const oldWidth = Math.hypot(points[1].x - points[0].x, points[1].y - points[0].y);
+    const oldHeight = Math.hypot(points[3].x - points[0].x, points[3].y - points[0].y);
+    if (!oldWidth || !oldHeight) continue;
+    const u = { x: (points[1].x - points[0].x) / oldWidth, y: (points[1].y - points[0].y) / oldWidth };
+    const v = { x: (points[3].x - points[0].x) / oldHeight, y: (points[3].y - points[0].y) / oldHeight };
+    const center = { x: (points[0].x + points[2].x) / 2, y: (points[0].y + points[2].y) / 2 };
+    const origin = {
+      x: center.x - (width * u.x + height * v.x) / 2,
+      y: center.y - (width * u.y + height * v.y) / 2,
+    };
+    instances.set(instance.id, [
+      origin,
+      { x: origin.x + width * u.x, y: origin.y + width * u.y },
+      { x: origin.x + width * u.x + height * v.x, y: origin.y + width * u.y + height * v.y },
+      { x: origin.x + height * v.x, y: origin.y + height * v.y },
+    ]);
+  }
+  for (const instance of state.rectangles) {
+    if (instance.symbol !== symbol.id) continue;
+    const preview = instances.get(instance.id);
+    if (!preview) continue;
+    instance.corners.forEach((pid, index) => {
+      state.points[pid] = { ...state.points[pid], id: pid, x: preview[index].x, y: preview[index].y };
+    });
+  }
+  symbolResizePreview = {
+    symbolId: symbol.id,
+    width,
+    height,
+    instances,
+    initialInstances,
+    sourceId: rectangle.id,
+    sourceCorners: corners,
+  };
+}
+
+function allVisibleConstraints() {
+  const shared = [];
+  for (const rectangle of state.rectangles || []) {
+    const symbol = (state.symbols || []).find(item => item.id === rectangle.symbol);
+    if (!symbol) continue;
+    for (const template of symbol.constraints || []) {
+      const expanded = JSON.parse(JSON.stringify(template));
+      expanded.instance = rectangle.id;
+      if (expanded.type === "angle") {
+        for (const ref of [expanded.a, expanded.b]) {
+          if (ref.kind === "segment") {
+            ref.start = rectangle.corners[ref.start_corner];
+            ref.end = rectangle.corners[ref.end_corner];
+          }
+        }
+      } else if (expanded.type === "horizontal" || expanded.type === "vertical") {
+        const ref = expanded.target;
+        if (ref.kind === "segment") {
+          ref.start = rectangle.corners[ref.start_corner];
+          ref.end = rectangle.corners[ref.end_corner];
+        }
+      } else if (expanded.type === "distance") {
+        for (const ref of [expanded.a, expanded.b]) {
+          if (ref.kind === "vertex" && ref.corner != null) {
+            ref.pid = rectangle.corners[ref.corner];
+          }
+        }
+      } else if (expanded.type === "coincident") {
+        expanded.a = rectangle.corners[expanded.a];
+        expanded.b = rectangle.corners[expanded.b];
+      }
+      shared.push(expanded);
+    }
+  }
+  return [...(state.constraints || []), ...shared];
+}
+
 function draw() {
   const w = canvas.width / dpr, h = canvas.height / dpr;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -606,18 +867,19 @@ function draw() {
   ctx.fillRect(0, 0, w, h);
   drawGrid(w, h);
   if (showC) {
-    for (const c of state.constraints) {
+    for (const c of allVisibleConstraints()) {
       if (c.type === "coincident") drawCoincident(c);
       else if (c.type === "angle") drawAngle(c);
     }
   }
   drawWalls();
   if (showC) {
-    for (const c of state.constraints) {
+    for (const c of allVisibleConstraints()) {
       if (c.type === "distance") drawDistance(c);
     }
-    for (const c of state.constraints) drawBadge(c);
+    for (const c of allVisibleConstraints()) drawBadge(c);
   }
+  drawRectangles();
   drawOpenings();
   drawPreview();
   drawHover();
@@ -680,6 +942,42 @@ function drawWalls() {
     for (const c of cs) {
       const s = toScreen(c.x, c.y);
       ctx.fillRect(s.x - 2.5, s.y - 2.5, 5, 5);
+    }
+  }
+}
+
+function drawRectangles() {
+  for (const rectangle of state.rectangles || []) {
+    const corners = rectangleRenderPoints(rectangle);
+    if (corners.length !== 4) continue;
+    const points = corners.map(p => toScreen(p.x, p.y));
+    const selected = selection?.kind === "rectangle" && selection.id === rectangle.id;
+    const hovered = hover?.kind === "rectangle" && hover.id === rectangle.id;
+    ctx.strokeStyle = selected ? "#ffb454" : hovered ? "#e8eef6" : "#9ad9bc";
+    ctx.lineWidth = selected ? 2.5 : 2;
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+    for (const p of [...points.slice(1), points[0]]) ctx.lineTo(p.x, p.y);
+    ctx.closePath();
+    ctx.fillStyle = selected ? "rgba(255,180,84,0.16)" : "rgba(126,200,165,0.06)";
+    ctx.fill();
+    ctx.stroke();
+    if (selected) {
+      ctx.fillStyle = "#ffb454";
+      ctx.strokeStyle = "#14181f";
+      ctx.lineWidth = 1;
+      for (const point of points) {
+        ctx.beginPath();
+        ctx.rect(point.x - 4, point.y - 4, 8, 8);
+        ctx.fill();
+        ctx.stroke();
+      }
+    }
+    const symbol = (state.symbols || []).find(item => item.id === rectangle.symbol);
+    if (symbol) {
+      const bounds = rectBounds(rectangle);
+      const center = toScreen((bounds.x1 + bounds.x2) / 2, (bounds.y1 + bounds.y2) / 2);
+      label(center.x, center.y, symbol.label, "#7ec8a5");
     }
   }
 }
@@ -760,10 +1058,10 @@ function drawAngle(c) {
   if (!g) return;
   const sel = selection && selection.kind === "constraint" && selection.id === c.id;
   const col = sel ? "#ffb454" : "#a78bfa";
-  const wa = wallsById[c.wall_a], wb = wallsById[c.wall_b];
-  if (!wa || !wb || !hasCorners(wa) || !hasCorners(wb)) return;
-  for (const w of [wa, wb]) {
-    const d = axisDir(w);
+  for (const ref of [c.a, c.b]) {
+    const points = linePoints(ref);
+    if (!points) continue;
+    const d = { x: points[1].x - points[0].x, y: points[1].y - points[0].y };
     const L = Math.hypot(d.x, d.y);
     if (L < 1e-9) continue;
     const ux = d.x / L, uy = d.y / L;
@@ -807,23 +1105,26 @@ function drawCoincident(c) {
   }
 }
 
-function drawBadge(c) {
-  const a = constraintAnchor(c);
-  if (!a) return;
-  const sel = selection && selection.kind === "constraint" && selection.id === c.id;
-  const col = sel ? "#ffb454" : COLORS[c.type];
+function drawBadgeAt(anchor, type, color) {
   ctx.beginPath();
-  ctx.arc(a.x, a.y, 8, 0, Math.PI * 2);
+  ctx.arc(anchor.x, anchor.y, 8, 0, Math.PI * 2);
   ctx.fillStyle = "rgba(20,24,31,0.92)";
   ctx.fill();
-  ctx.strokeStyle = col;
+  ctx.strokeStyle = color;
   ctx.lineWidth = 1.2;
   ctx.stroke();
-  ctx.fillStyle = col;
+  ctx.fillStyle = color;
   ctx.font = "9px ui-monospace, monospace";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  ctx.fillText(GLYPHS[c.type] || "?", a.x, a.y + 0.5);
+  ctx.fillText(GLYPHS[type] || "?", anchor.x, anchor.y + 0.5);
+}
+
+function drawBadge(c) {
+  const anchor = constraintAnchor(c);
+  if (!anchor) return;
+  const selected = selection && selection.kind === "constraint" && selection.id === c.id;
+  drawBadgeAt(anchor, c.type, selected ? "#ffb454" : COLORS[c.type]);
 }
 
 function label(x, y, text, color) {
@@ -852,6 +1153,104 @@ function roundRect(x, y, w, h, r) {
 }
 
 function drawPreview() {
+  if (tool === "wall-path" && pending.length && mouse.inside) {
+    const vertices = pending.map(point => ({ x: point.x, y: point.y }));
+    vertices.push(snapWorld({ x: mouse.wx, y: mouse.wy }));
+    const normals = [];
+    for (let index = 0; index < vertices.length - 1; index++) {
+      const a = vertices[index], b = vertices[index + 1];
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const length = Math.hypot(dx, dy) || 1;
+      normals.push({ x: -dy / length, y: dx / length });
+    }
+    const area = vertices.slice(0, -1).reduce((sum, point, index) => {
+      const next = vertices[index + 1];
+      return sum + point.x * next.y - next.x * point.y;
+    }, 0);
+    const side = area >= 0 ? 1 : -1;
+    const offsetPoints = vertices.map((vertex, index) => {
+      const previous = normals[Math.max(0, index - 1)];
+      const next = normals[Math.min(normals.length - 1, index)];
+      let nx = previous.x + next.x, ny = previous.y + next.y;
+      const norm = Math.hypot(nx, ny) || 1;
+      nx /= norm;
+      ny /= norm;
+      const denom = Math.abs(nx * next.x + ny * next.y) || 1;
+      const distance = side * wallThickness / 2 / denom;
+      return toScreen(vertex.x + nx * distance, vertex.y + ny * distance);
+    });
+    ctx.strokeStyle = "rgba(108,208,255,0.8)";
+    ctx.setLineDash([5, 4]);
+    ctx.lineWidth = 1.5;
+    for (let index = 0; index < offsetPoints.length - 1; index++) {
+      line2(offsetPoints[index], offsetPoints[index + 1]);
+    }
+    ctx.setLineDash([]);
+  }
+  if (tool === "cut" && mouse.inside) {
+    const wall = pickWall({ x: mouse.wx, y: mouse.wy });
+    if (wall) {
+      const station = projectOpening({ x: mouse.wx, y: mouse.wy }, wall);
+      const axis = wallAxis(wall);
+      const dx = axis.bx - axis.ax, dy = axis.by - axis.ay;
+      const length = Math.hypot(dx, dy) || 1;
+      const marker = toScreen(axis.ax + dx / length * station, axis.ay + dy / length * station);
+      ctx.strokeStyle = "#ffb454";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(marker.x - 7, marker.y - 7);
+      ctx.lineTo(marker.x + 7, marker.y + 7);
+      ctx.moveTo(marker.x - 7, marker.y + 7);
+      ctx.lineTo(marker.x + 7, marker.y - 7);
+      ctx.stroke();
+    }
+  }
+  if (((tool === "rectangle" && pending.length === 1) || symbolPlacement) && mouse.inside) {
+    let bounds;
+    if (symbolPlacement) {
+      const center = snapWorld({ x: mouse.wx, y: mouse.wy });
+      bounds = {
+        x1: center.x - symbolPlacement.width / 2,
+        y1: center.y - symbolPlacement.height / 2,
+        x2: center.x + symbolPlacement.width / 2,
+        y2: center.y + symbolPlacement.height / 2,
+      };
+    } else {
+      const start = pending[0];
+      const end = snapWorld({ x: mouse.wx, y: mouse.wy });
+      bounds = {
+        x1: Math.min(start.x, end.x),
+        y1: Math.min(start.y, end.y),
+        x2: Math.max(start.x, end.x),
+        y2: Math.max(start.y, end.y),
+      };
+    }
+    const points = [
+      { x: bounds.x1, y: bounds.y1 },
+      { x: bounds.x2, y: bounds.y1 },
+      { x: bounds.x2, y: bounds.y2 },
+      { x: bounds.x1, y: bounds.y2 },
+    ].map(p => toScreen(p.x, p.y));
+    ctx.strokeStyle = "rgba(126,200,165,0.8)";
+    ctx.setLineDash([5, 4]);
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+    for (const p of [...points.slice(1), points[0]]) ctx.lineTo(p.x, p.y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  if (tool === "wall-path" && mouse.inside && hover?.kind === "point") {
+    const point = state.points[hover.id];
+    if (point) {
+      const screen = toScreen(point.x, point.y);
+      ctx.beginPath();
+      ctx.arc(screen.x, screen.y, 8, 0, Math.PI * 2);
+      ctx.strokeStyle = "rgba(108,208,255,0.9)";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+  }
   if ((tool === "dim" || tool === "coincident") && mouse.inside) {
     const target = pickTarget({ x: mouse.wx, y: mouse.wy });
     if (target && target.kind === "vertex") {
@@ -950,6 +1349,16 @@ function drawHover() {
     ctx.strokeStyle = "#6cd0ff";
     ctx.lineWidth = 1.5;
     ctx.stroke();
+  } else if (hover.kind === "rectangle") {
+    const rectangle = (state.rectangles || []).find(item => item.id === hover.id);
+    if (!rectangle) return;
+    ctx.strokeStyle = "rgba(126,200,165,0.8)";
+    ctx.lineWidth = 4;
+    const points = rectanglePoints(rectangle).map(p => toScreen(p.x, p.y));
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+    for (const p of [...points.slice(1), points[0]]) ctx.lineTo(p.x, p.y);
+    ctx.stroke();
   } else if (hover.kind === "opening-length") {
     const opening = (state.openings || []).find(item => item.id === hover.id);
     const ends = opening && openingEnds(opening);
@@ -1001,6 +1410,8 @@ function drawHover() {
 function setTool(t) {
   tool = t;
   pending = [];
+  if (!symbolPlacement && t !== "rectangle") rectangleGesture = null;
+  if (t !== "rectangle") symbolPlacement = null;
   for (const b of document.querySelectorAll("[data-tool]")) {
     b.classList.toggle("active", b.dataset.tool === t);
   }
@@ -1011,12 +1422,14 @@ function setTool(t) {
 const HINTS = {
   select: "Drag corners or walls · drag opening ends to resize or its middle to move · right-drag rotates walls",
   wall: "Click two axis points; snapping to a corner creates a coincident constraint (Esc cancels)",
+  "wall-path": "Click path vertices; Enter closes a polygon, double-click finishes an open path, Esc cancels",
+  cut: "Click a wall to split it at that position (Esc cancels)",
   opening: "Click two points along a wall axis to create an opening (Esc cancels)",
   dim: "Click two targets (opening segment or handle, corner, wall edge, or wall axis end)",
-  angle: "Click two walls, then enter the angle",
+  angle: "Click two wall axes or rectangle sides, then enter the angle",
   coincident: "Click two wall corners to make them coincident",
-  horizontal: "Click a wall to constrain its axis horizontal",
-  vertical: "Click a wall to constrain its axis vertical",
+  horizontal: "Click a wall axis or rectangle side to make it horizontal",
+  vertical: "Click a wall axis or rectangle side to make it vertical",
 };
 
 function flash(msg) {
@@ -1037,7 +1450,13 @@ function sendDrag(pointsMap, force) {
 }
 
 function updateHover(w) {
-  if (tool === "dim") {
+  if (tool === "cut") {
+    const wall = pickWall(w);
+    hover = wall ? { kind: "wall", id: wall.id } : null;
+  } else if (tool === "wall-path") {
+    const target = pickWallPathCorner(w);
+    hover = target ? { kind: "point", id: target.pid } : null;
+  } else if (tool === "dim") {
     const target = pickTarget(w);
     if (!target) hover = null;
     else if (target.kind === "opening") {
@@ -1052,16 +1471,23 @@ function updateHover(w) {
       hover = { kind: "point", id: target.pid };
     }
   } else if (tool === "select") {
-    const opening = pickOpening(w);
-    if (opening) hover = { kind: "opening", id: opening.id };
+    const rectangle = pickRectangle(w);
+    if (rectangle) hover = { kind: "rectangle", id: rectangle.id };
     else {
-      const p = pickPoint(w);
-      if (p) hover = { kind: "point", id: p.id };
+      const opening = pickOpening(w);
+      if (opening) hover = { kind: "opening", id: opening.id };
       else {
-        const wall = pickWall(w);
-        hover = wall ? { kind: "wall", id: wall.id } : null;
+        const p = pickPoint(w);
+        if (p) hover = { kind: "point", id: p.id };
+        else {
+          const wall = pickWall(w);
+          hover = wall ? { kind: "wall", id: wall.id } : null;
+        }
       }
     }
+  } else if (tool === "rectangle" || tool === "select") {
+    const rectangle = pickRectangle(w);
+    hover = rectangle ? { kind: "rectangle", id: rectangle.id } : null;
   } else if (tool === "opening") {
     const wall = pickWall(w);
     hover = wall ? { kind: "wall", id: wall.id } : null;
@@ -1073,6 +1499,23 @@ function updateHover(w) {
 }
 
 canvas.addEventListener("dblclick", (e) => {
+  if (tool === "wall-path") {
+    e.preventDefault();
+    if (pending.length < 2) {
+      flash("an open wall path needs at least two points");
+      return;
+    }
+    send({
+      op: "add_wall_path",
+      vertices: pending.map(point => [point.x, point.y]),
+      joins: pending.map(point => point.pid),
+      closed: false,
+      thickness: wallThickness,
+    });
+    pending = [];
+    draw();
+    return;
+  }
   if (!dialogEl.hidden || tool !== "select") return;
   const c = pickConstraint(eventWorld(e));
   if (!c) return;
@@ -1094,22 +1537,37 @@ canvas.addEventListener("pointerdown", (e) => {
     return;
   }
   if (e.button === 2) {
-    // right-drag rotates the selected wall (or the wall under the cursor)
-    // around the clicked point; with no wall involved it pans
+    let rectangle = tool === "select" ? pickRectangle(w) : null;
     let wall = null;
-    if (tool === "select") {
+    if (!rectangle && tool === "select") {
       if (selection && selection.kind === "wall") wall = wallsById[selection.id];
       if (!wall || !hasCorners(wall)) wall = pickWall(w);
     }
-    if (wall && hasCorners(wall)) {
+    if (rectangle) {
+      selection = { kind: "rectangle", id: rectangle.id };
+      syncPanel();
+      const points = rectanglePoints(rectangle);
+      const pivot = {
+        x: points.reduce((sum, point) => sum + point.x, 0) / points.length,
+        y: points.reduce((sum, point) => sum + point.y, 0) / points.length,
+      };
+      const reference = Math.hypot(w.x - pivot.x, w.y - pivot.y) > 0.02
+        ? w
+        : points[1];
+      rotate = {
+        id: rectangle.id,
+        kind: "rectangle",
+        pids: [...rectangle.corners],
+        orig: points.map(point => ({ x: point.x, y: point.y })),
+        pivot,
+        startAng: Math.atan2(reference.y - pivot.y, reference.x - pivot.x),
+      };
+      draw();
+    } else if (wall && hasCorners(wall)) {
       if (!selection || selection.id !== wall.id) {
         selection = { kind: "wall", id: wall.id };
         syncPanel();
       }
-      // rotate around the wall's own center; the cursor sets the angle.
-      // If the press lands on the center there is no cursor-to-pivot angle,
-      // so the wall's own axis direction becomes the reference and the far
-      // end follows the cursor like a handle.
       const cs = corners(wall);
       const pivot = {
         x: (cs[0].x + cs[1].x + cs[2].x + cs[3].x) / 4,
@@ -1121,6 +1579,7 @@ canvas.addEventListener("pointerdown", (e) => {
         : Math.atan2(cs[3].y - cs[0].y, cs[3].x - cs[0].x);
       rotate = {
         id: wall.id,
+        kind: "wall",
         pids: [...wall.corners],
         orig: cs.map(c => ({ x: c.x, y: c.y })),
         pivot,
@@ -1135,8 +1594,89 @@ canvas.addEventListener("pointerdown", (e) => {
   }
   if (e.button !== 0) return;
 
+  if (tool === "wall-path") {
+    const point = snapWorld(w);
+    if (pending.length > 2 && Math.hypot(
+      point.x - pending[0].x,
+      point.y - pending[0].y,
+    ) < 0.05) {
+      send({
+        op: "add_wall_path",
+        vertices: pending.map(p => [p.x, p.y]),
+        joins: pending.map(p => p.pid),
+        closed: true,
+        thickness: wallThickness,
+      });
+      pending = [];
+      return;
+    }
+    if (pending.length && Math.hypot(point.x - pending[pending.length - 1].x, point.y - pending[pending.length - 1].y) < 0.01) return;
+    const join = pickWallPathCorner(w);
+    pending.push({ x: point.x, y: point.y, pid: join?.id ?? null });
+    return;
+  }
+  if (tool === "cut") {
+    const wall = pickWall(w);
+    if (!wall) { flash("click a wall to split"); return; }
+    send({ op: "cut_wall", id: wall.id, station: projectOpening(w, wall) });
+    return;
+  }
+
+  if (symbolPlacement) {
+    const center = snapWorld(w);
+    send({
+      op: "add_rectangle",
+      x1: center.x - symbolPlacement.width / 2,
+      y1: center.y - symbolPlacement.height / 2,
+      x2: center.x + symbolPlacement.width / 2,
+      y2: center.y + symbolPlacement.height / 2,
+      symbol: symbolPlacement.id,
+    });
+    symbolPlacement = null;
+    setTool("select");
+    return;
+  }
+
+  if (tool === "rectangle") {
+    const point = snapWorld(w);
+    pending.push({ x: point.x, y: point.y });
+    if (pending.length === 2) {
+      const [start, end] = pending;
+      pending = [];
+      if (Math.abs(end.x - start.x) < 0.01 || Math.abs(end.y - start.y) < 0.01) {
+        flash("rectangle needs positive width and height");
+        return;
+      }
+      send({ op: "add_rectangle", x1: start.x, y1: start.y, x2: end.x, y2: end.y });
+    }
+    return;
+  }
+
   if (tool === "select") {
+    let rectangle = null, corner = null;
+    for (const candidate of state.rectangles || []) {
+      const index = pickRectangleCorner(candidate, w);
+      if (index !== null) { rectangle = candidate; corner = index; break; }
+    }
+    if (!rectangle) rectangle = pickRectangle(w);
+    if (rectangle) {
+      selection = { kind: "rectangle", id: rectangle.id };
+      const points = rectanglePoints(rectangle);
+      const symbol = (state.symbols || []).find(item => item.id === rectangle.symbol);
+      drag = {
+        mode: corner === null ? "rectangle" : "rectangle_resize",
+        id: rectangle.id,
+        corner,
+        start: w,
+        orig: points.map(point => ({ x: point.x, y: point.y })),
+        final: points.map(point => ({ x: point.x, y: point.y })),
+      };
+      syncPanel();
+      draw();
+      return;
+    }
     const opening = pickOpening(w);
+
     if (opening) {
       const wall = wallsById[opening.wall];
       const ends = openingEnds(opening);
@@ -1163,17 +1703,17 @@ canvas.addEventListener("pointerdown", (e) => {
       draw();
       return;
     }
-    const p = pickPoint(w);
-    if (p) {
-      drag = { mode: "point", id: p.id };
-      selection = null;
-      return;
-    }
     const constraint = pickConstraint(w);
     if (constraint) {
       selection = { kind: "constraint", id: constraint.id };
       syncPanel();
       draw();
+      return;
+    }
+    const p = pickPoint(w);
+    if (p) {
+      drag = { mode: "point", id: p.id };
+      selection = null;
       return;
     }
     const wall = pickWall(w);
@@ -1321,12 +1861,6 @@ canvas.addEventListener("pointerdown", (e) => {
           : null;
       const hasLengthConstraint = lengthOpeningId !== null
         && state.constraints.some(c => openingLengthRefs(c)?.opening === lengthOpeningId);
-      if (sameOpening && !hasLengthConstraint) {
-        send({ op: "add_constraint", constraint: {
-          type: "distance", a: refOf(t1), b: refOf(t2), length: cur,
-        } });
-        return;
-      }
       const axisLength = t1.kind === "wall-end" && t2.kind === "wall-end"
         && t1.wall === t2.wall && t1.end !== t2.end;
       const dimensionName = sameOpeningLengthTarget || (sameOpening && hasLengthConstraint)
@@ -1347,22 +1881,28 @@ canvas.addEventListener("pointerdown", (e) => {
             type: "distance", a: refOf(t1), b: refOf(t2), length: v,
           } });
         },
+        true,
       );
     }
     return;
   }
 
   if (tool === "angle") {
-    const wall = pickWall(w);
-    if (!wall) { flash("click on a wall"); return; }
-    if (pending[0] && pending[0].id === wall.id) return;
-    pending.push(wall);
+    const line = pickConstraintLine(w);
+    if (!line) { flash("click on a wall axis or rectangle side"); return; }
+    const key = lineRefKey(line);
+    if (pending[0] && lineRefKey(pending[0]) === key) return;
+    pending.push(line);
     if (pending.length === 2) {
-      const [w1, w2] = pending;
+      const [a, b] = pending;
       pending = [];
-      openDialog("Angle (degrees)", fmtDeg(Math.abs(currentAngleDeg(w1, w2))), parseAngle, (v) => {
-        send({ op: "add_constraint", constraint: { type: "angle", wall_a: w1.id, wall_b: w2.id, degrees: v } });
-      });
+      const pa = linePoints(a), pb = linePoints(b);
+      const av = { x: pa[1].x - pa[0].x, y: pa[1].y - pa[0].y };
+      const bv = { x: pb[1].x - pb[0].x, y: pb[1].y - pb[0].y };
+      const degrees = Math.atan2(av.x * bv.y - av.y * bv.x, av.x * bv.x + av.y * bv.y) * 180 / Math.PI;
+      openDialog("Angle (degrees)", fmtDeg(Math.abs(degrees)), parseAngle, value => {
+        send({ op: "add_constraint", constraint: { type: "angle", a, b, degrees: value } });
+      }, true);
     }
     return;
   }
@@ -1382,11 +1922,11 @@ canvas.addEventListener("pointerdown", (e) => {
   }
 
   if (tool === "horizontal" || tool === "vertical") {
-    const wall = pickWall(w);
-    if (wall) {
-      send({ op: "add_constraint", constraint: { type: tool, wall: wall.id } });
+    const target = pickConstraintLine(w);
+    if (target) {
+      send({ op: "add_constraint", constraint: { type: tool, target } });
     } else {
-      flash("click on a wall");
+      flash("click on a wall axis or rectangle side");
     }
   }
 });
@@ -1426,19 +1966,36 @@ canvas.addEventListener("pointermove", (e) => {
     return;
   }
 
+
+  if (symbolPlacement) {
+    draw();
+    return;
+  }
+
   if (rotate) {
     const delta = Math.atan2(w.y - rotate.pivot.y, w.x - rotate.pivot.x) - rotate.startAng;
     const cos = Math.cos(delta), sin = Math.sin(delta);
-    const map = {};
-    rotate.pids.forEach((pid, i) => {
-      const o = rotate.orig[i];
-      const nx = rotate.pivot.x + (o.x - rotate.pivot.x) * cos - (o.y - rotate.pivot.y) * sin;
-      const ny = rotate.pivot.y + (o.x - rotate.pivot.x) * sin + (o.y - rotate.pivot.y) * cos;
-      const p = state.points[pid];
-      if (p) { p.x = nx; p.y = ny; }
-      map[pid] = [nx, ny];
-    });
-    sendDrag(map);
+      const map = {};
+      const rotated = [];
+      rotate.pids.forEach((pid, i) => {
+        const original = rotate.orig[i];
+        const nx = rotate.pivot.x + (original.x - rotate.pivot.x) * cos - (original.y - rotate.pivot.y) * sin;
+        const ny = rotate.pivot.y + (original.x - rotate.pivot.x) * sin + (original.y - rotate.pivot.y) * cos;
+        const point = state.points[pid];
+        if (point) { point.x = nx; point.y = ny; }
+        rotated.push([nx, ny]);
+        map[pid] = [nx, ny];
+      });
+      if (rotate.kind === "rectangle") {
+        const now = performance.now();
+        if (now - lastDragSend >= 33) {
+          lastDragSend = now;
+          send({ op: "update_rectangle_corners", id: rotate.id, corners: rotated });
+        }
+      } else {
+        sendDrag(map);
+      }
+
     draw();
     return;
   }
@@ -1461,6 +2018,42 @@ canvas.addEventListener("pointermove", (e) => {
       const p = state.points[drag.id];
       if (p) { p.x = s.x; p.y = s.y; }
       sendDrag({ [drag.id]: [s.x, s.y] });
+    } else if (drag.mode === "rectangle" || drag.mode === "rectangle_resize") {
+      const rectangle = (state.rectangles || []).find(item => item.id === drag.id);
+      if (drag.mode === "rectangle") {
+        const dx = w.x - drag.start.x, dy = w.y - drag.start.y;
+        drag.final = drag.orig.map(point => ({ x: point.x + dx, y: point.y + dy }));
+      } else {
+        const opposite = (drag.corner + 2) % 4;
+        const fixed = drag.orig[opposite];
+        const ux = drag.orig[1].x - drag.orig[0].x;
+        const uy = drag.orig[1].y - drag.orig[0].y;
+        const vx = drag.orig[3].x - drag.orig[0].x;
+        const vy = drag.orig[3].y - drag.orig[0].y;
+        const ul = Math.hypot(ux, uy), vl = Math.hypot(vx, vy);
+        const u = { x: ux / ul, y: uy / ul }, v = { x: vx / vl, y: vy / vl };
+        const dx = w.x - fixed.x, dy = w.y - fixed.y;
+        const signU = drag.corner === 0 || drag.corner === 3 ? -1 : 1;
+        const signV = drag.corner === 0 || drag.corner === 1 ? -1 : 1;
+        const width = Math.max(0.001, Math.abs(dx * u.x + dy * u.y));
+        const height = Math.max(0.001, Math.abs(dx * v.x + dy * v.y));
+        const center = {
+          x: fixed.x + signU * width / 2 * u.x + signV * height / 2 * v.x,
+          y: fixed.y + signU * width / 2 * u.y + signV * height / 2 * v.y,
+        };
+        drag.final = drag.orig.map((_, index) => {
+          const cornerX = index === 0 || index === 3 ? -1 : 1;
+          const cornerY = index < 2 ? -1 : 1;
+          return {
+            x: center.x + cornerX * width / 2 * u.x + cornerY * height / 2 * v.x,
+            y: center.y + cornerX * width / 2 * u.y + cornerY * height / 2 * v.y,
+          };
+        });
+      }
+      if (rectangle) rectangle.corners = drag.final;
+      if (drag.mode === "rectangle_resize") updateSymbolResizePreview(rectangle, drag.final);
+      else if (symbolResizePreview) symbolResizePreview = null;
+      send({ op: "update_rectangle_corners", id: drag.id, corners: drag.final.map(point => [point.x, point.y]) });
     } else if (drag.mode === "wall") {
       // translate the whole rectangle, snapped to the grid
       const step = gridSteps()[0];
@@ -1488,14 +2081,22 @@ canvas.addEventListener("pointermove", (e) => {
 
 canvas.addEventListener("pointerup", (e) => {
   if (pan) { pan = null; return; }
+  if (symbolPlacement) return;
   if (rotate) {
-    // commit the rotated positions, then trigger a full solve
     const map = {};
+    const points = [];
     rotate.pids.forEach((pid) => {
-      const p = state.points[pid];
-      if (p) map[pid] = [p.x, p.y];
+      const point = state.points[pid];
+      if (point) {
+        map[pid] = [point.x, point.y];
+        points.push([point.x, point.y]);
+      }
     });
-    sendDrag(map, true);
+    if (rotate.kind === "rectangle") {
+      send({ op: "update_rectangle_corners", id: rotate.id, corners: points });
+    } else {
+      sendDrag(map, true);
+    }
     send({ op: "drag_end" });
     rotate = null;
     return;
@@ -1510,6 +2111,28 @@ canvas.addEventListener("pointerup", (e) => {
     } else if (drag.mode === "point") {
       const p = state.points[drag.id];
       if (p) sendDrag({ [drag.id]: [p.x, p.y] }, true);
+    } else if (drag.mode === "rectangle" || drag.mode === "rectangle_resize") {
+      const points = drag.final || drag.orig;
+      send({ op: "update_rectangle_corners", id: drag.id, corners: points.map(point => [point.x, point.y]) });
+      if (drag.mode === "rectangle_resize" && symbolResizePreview) {
+        symbolResizePreview.released = true;
+        const symbol = state.symbols.find(item => item.id === symbolResizePreview.symbolId);
+        if (symbol) {
+          symbol.width = symbolResizePreview.width;
+          symbol.height = symbolResizePreview.height;
+          for (const rectangle of state.rectangles) {
+            if (rectangle.symbol !== symbol.id) continue;
+            const preview = symbolResizePreview.instances.get(rectangle.id);
+            if (!preview) continue;
+            rectangle.corners.forEach((pid, index) => {
+              state.points[pid] = { ...state.points[pid], x: preview[index].x, y: preview[index].y };
+            });
+          }
+        }
+      }
+      if (drag.mode === "rectangle_resize" && symbolResizePreview) {
+        symbolResizePreview.released = true;
+      }
     } else if (drag.mode === "wall") {
       const map = {};
       drag.pids.forEach((pid) => {
@@ -1550,17 +2173,35 @@ function zoomAt(px, py, factor) {
 let dialogSubmit = null;
 let dialogParse = null;
 
-function openDialog(labelText, value, parse, onSubmit) {
+function openDialog(labelText, value, parse, onSubmit, selectValue = false) {
   dialogSubmit = onSubmit;
   dialogParse = parse;
   dialogLabel.textContent = labelText;
   dialogInput.value = value;
   dialogEl.hidden = false;
-  dialogInput.focus();
-  dialogInput.select();
+  requestAnimationFrame(() => {
+    dialogInput.focus();
+    if (selectValue) dialogInput.setSelectionRange(0, dialogInput.value.length);
+  });
 }
 
 function editConstraint(c) {
+  if (c.shared_symbol) {
+    const symbol = state.symbols.find(item => item.id === c.shared_symbol);
+    const constraint = symbol?.constraints.find(item => item.id === c.id);
+    if (!constraint) return;
+    const owner = symbol.label;
+    if (constraint.type === "distance") {
+      openDialog(`Shared ${owner} distance`, fmtLen(constraint.length), parseLen, value => {
+        send({ op: "update_constraint", id: constraint.id, value });
+      });
+    } else if (constraint.type === "angle") {
+      openDialog(`Shared ${owner} angle (degrees)`, fmtDeg(Math.abs(constraint.degrees)), parseAngle, value => {
+        send({ op: "update_constraint", id: constraint.id, value });
+      });
+    }
+    return;
+  }
   if (c.type === "distance") {
     const isOpeningLength = c.a.kind === "opening-length"
       || c.b.kind === "opening-length"
@@ -1610,8 +2251,12 @@ function pname(pid) {
   return p ? p.name : "?";
 }
 
-function refName(r) {
+function refName(r, rectangleId = null) {
   if (r.kind === "vertex") return pname(r.pid);
+  if (r.corner != null) {
+    const rectangle = state.rectangles.find(item => item.id === rectangleId);
+    return rectangle ? pname(rectangle.corners[r.corner]) : `corner ${r.corner + 1}`;
+  }
   if (r.kind === "opening") {
     const opening = (state.openings || []).find(item => item.id === r.opening);
     const name = opening ? `${opening.name}·` : "?";
@@ -1629,23 +2274,85 @@ function refName(r) {
   return `${w ? w.name : "?"}·${r.side > 0 ? "+" : "−"}`;
 }
 
+function lineName(ref, rectangleId = null) {
+  if (ref.kind === "wall") return wallsById[ref.wall]?.name ?? "?";
+  if (ref.start_corner != null) {
+    const rectangle = state.rectangles.find(item => item.id === rectangleId);
+    return rectangle
+      ? `${state.points[rectangle.corners[ref.start_corner]]?.name ?? "?"}–${state.points[rectangle.corners[ref.end_corner]]?.name ?? "?"}`
+      : `corner ${ref.start_corner + 1}–${ref.end_corner + 1}`;
+  }
+  const start = state.points[ref.start], end = state.points[ref.end];
+  return `${start?.name ?? "?"}–${end?.name ?? "?"}`;
+}
+
 function describe(c) {
-  if (c.type === "distance") return `${fmtLen(c.length)}  (${refName(c.a)}–${refName(c.b)})`;
-  if (c.type === "angle") return `${fmtDeg(Math.abs(c.degrees))}  (${wallsById[c.wall_a]?.name ?? "?"}·${wallsById[c.wall_b]?.name ?? "?"})`;
-  if (c.type === "coincident") return `${pname(c.a)} ≡ ${pname(c.b)}`;
-  if (c.type === "horizontal") return `${wallsById[c.wall]?.name ?? "?"} horizontal`;
-  return `${wallsById[c.wall]?.name ?? "?"} vertical`;
+  const shared = c.shared_symbol ? "Shared · " : "";
+  if (c.type === "distance") return `${shared}${fmtLen(c.length)}  (${refName(c.a, c.instance)}–${refName(c.b, c.instance)})`;
+  if (c.type === "angle") return `${shared}${fmtDeg(Math.abs(c.degrees))}  (${lineName(c.a, c.instance)}·${lineName(c.b, c.instance)})`;
+  if (c.type === "coincident") return `${shared}${pname(c.a)} ≡ ${pname(c.b)}`;
+  if (c.type === "horizontal") return `${shared}${lineName(c.target, c.instance)} horizontal`;
+  return `${shared}${lineName(c.target, c.instance)} vertical`;
+}
+
+let symbolSaveTarget = null;
+let pendingSymbolSave = null;
+
+function saveSelectedRectangle() {
+  let rectangle = state.rectangles.find(item => item.id === selection?.id);
+  if (!rectangle) {
+    rectangle = [...state.rectangles].reverse().find(item => !item.symbol);
+    if (!rectangle) rectangle = state.rectangles[state.rectangles.length - 1];
+    if (rectangle) {
+      selection = { kind: "rectangle", id: rectangle.id };
+      syncPanel();
+      draw();
+    }
+  }
+  if (!rectangle) {
+    flash("draw a rectangle before saving a symbol");
+    return;
+  }
+  setSidebarTab("symbols");
+  symbolSaveTarget = rectangle.id;
+  pendingSymbolSave = null;
+  const symbol = state.symbols.find(item => item.id === rectangle.symbol);
+  symbolLabelInput.value = symbol ? symbol.label : "";
+  symbolModal.hidden = false;
+  symbolLabelInput.focus();
+  symbolLabelInput.select();
+}
+
+function closeSymbolModal(save) {
+  if (symbolModal.hidden) return;
+  if (save && symbolSaveTarget) {
+    const text = symbolLabelInput.value.trim();
+    if (!text) {
+      flash("enter a symbol label");
+      symbolLabelInput.focus();
+      return;
+    }
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      flash("not connected; symbol was not saved");
+      return;
+    }
+    pendingSymbolSave = { id: symbolSaveTarget, label: text };
+    send({ op: "save_symbol", ...pendingSymbolSave });
+  }
+  symbolModal.hidden = true;
+  symbolSaveTarget = null;
 }
 
 function syncPanel() {
   listEl.innerHTML = "";
-  if (!state.constraints.length) {
+  const visibleConstraints = allVisibleConstraints();
+  if (!visibleConstraints.length) {
     const li = document.createElement("li");
     li.className = "placeholder";
     li.textContent = "No constraints yet";
     listEl.appendChild(li);
   }
-  for (const c of state.constraints) {
+  for (const c of visibleConstraints) {
     const li = document.createElement("li");
     if (selection && selection.kind === "constraint" && selection.id === c.id) {
       li.classList.add("selected");
@@ -1659,7 +2366,7 @@ function syncPanel() {
     const del = document.createElement("button");
     del.className = "cdel";
     del.textContent = "✕";
-    del.title = "Delete constraint";
+    del.title = c.shared_symbol ? "Delete shared symbol constraint" : "Delete constraint";
     del.addEventListener("click", (e) => {
       e.stopPropagation();
       send({ op: "delete", id: c.id });
@@ -1680,8 +2387,84 @@ function syncPanel() {
     li.append(name, desc, del);
     listEl.appendChild(li);
   }
+  syncSymbolPanel();
   syncStatus();
 }
+
+function setSidebarTab(name) {
+  const constraintsActive = name === "constraints";
+  const constraintsTab = document.getElementById("constraints-tab");
+  const symbolsTab = document.getElementById("symbols-tab");
+  const constraintsPanel = document.getElementById("constraints-panel");
+  const symbolsPanel = document.getElementById("symbols-panel");
+  constraintsTab.classList.toggle("active", constraintsActive);
+  symbolsTab.classList.toggle("active", !constraintsActive);
+  constraintsTab.setAttribute("aria-selected", String(constraintsActive));
+  symbolsTab.setAttribute("aria-selected", String(!constraintsActive));
+  constraintsPanel.hidden = !constraintsActive;
+  symbolsPanel.hidden = constraintsActive;
+}
+
+document.getElementById("constraints-tab").addEventListener("click", () => setSidebarTab("constraints"));
+document.getElementById("symbols-tab").addEventListener("click", () => setSidebarTab("symbols"));
+saveSymbolButton.addEventListener("click", saveSelectedRectangle);
+
+function syncSymbolPanel() {
+  symbolListEl.innerHTML = "";
+  const selectedRectangle = state.rectangles.find(item => item.id === selection?.id);
+  saveSymbolButton.disabled = state.rectangles.length === 0;
+  saveSymbolButton.textContent = selectedRectangle?.symbol
+    ? "Edit symbol label"
+    : selectedRectangle
+      ? "Save selected as symbol"
+      : "Save latest as symbol";
+  if (!state.symbols.length) {
+    const li = document.createElement("li");
+    li.className = "placeholder";
+    li.textContent = "No symbols saved";
+    symbolListEl.appendChild(li);
+  }
+  if (selectedRectangle?.symbol) {
+    const editLabel = document.createElement("button");
+    editLabel.className = "symbol-save";
+    editLabel.textContent = "Edit symbol label";
+    editLabel.addEventListener("click", saveSelectedRectangle);
+    symbolListEl.appendChild(editLabel);
+    const detach = document.createElement("button");
+    detach.className = "symbol-save";
+    detach.textContent = "Make independent rectangle";
+    detach.title = "Detach this instance from its shared symbol constraints";
+    detach.addEventListener("click", () => send({ op: "detach_rectangle", id: selectedRectangle.id }));
+    symbolListEl.appendChild(detach);
+  }
+  for (const symbol of state.symbols) {
+    const li = document.createElement("li");
+    li.className = "symbol-row";
+    const name = document.createElement("span");
+    name.className = "cdesc";
+    const instances = (state.rectangles || []).filter(r => r.symbol === symbol.id);
+    name.textContent = `${symbol.label} (${fmtLen(symbol.width)} × ${fmtLen(symbol.height)})`;
+    if (instances.length) name.textContent += ` · ${instances.length} placed`;
+    const place = document.createElement("button");
+    place.textContent = "Place";
+    place.addEventListener("click", () => {
+      symbolPlacement = { id: symbol.id, width: symbol.width, height: symbol.height, start: null };
+      rectangleGesture = null;
+      setTool("rectangle");
+      flash(`Place ${symbol.label}: click where its center should be`);
+    });
+    li.append(name, place);
+    symbolListEl.appendChild(li);
+  }
+}
+
+document.getElementById("symbol-save").addEventListener("click", () => closeSymbolModal(true));
+document.getElementById("symbol-cancel").addEventListener("click", () => closeSymbolModal(false));
+symbolLabelInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") closeSymbolModal(true);
+  else if (e.key === "Escape") closeSymbolModal(false);
+  e.stopPropagation();
+});
 
 function syncStatus() {
   const st = state.status;
@@ -1699,16 +2482,34 @@ function syncStatus() {
 
 /* ---------- keyboard ---------- */
 window.addEventListener("keydown", (e) => {
-  if (!dialogEl.hidden) return;
+  if (!dialogEl.hidden || !symbolModal.hidden) return;
   if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
   const tools = {
-    s: "select", w: "wall", o: "opening", d: "dim", a: "angle",
+    s: "select", w: "wall", p: "wall-path", x: "cut", o: "opening", d: "dim", a: "angle",
     c: "coincident", h: "horizontal", v: "vertical",
   };
   const k = e.key.toLowerCase();
   if (tools[k]) { setTool(tools[k]); return; }
+  if (e.key === "Enter" && tool === "wall-path") {
+    if (pending.length < 3) {
+      flash("a closed wall path needs at least three points");
+      return;
+    }
+    send({
+      op: "add_wall_path",
+      vertices: pending.map(point => [point.x, point.y]),
+      joins: pending.map(point => point.pid),
+      closed: true,
+      thickness: wallThickness,
+    });
+    pending = [];
+    return;
+  }
   if (e.key === "Escape") {
     pending = [];
+    rectangleGesture = null;
+    symbolPlacement = null;
+    if (!symbolModal.hidden) closeSymbolModal(false);
     selection = null;
     syncPanel();
     draw();

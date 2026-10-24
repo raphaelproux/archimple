@@ -26,10 +26,29 @@ removable **coincident constraint** between the two vertices instead of
 sharing a point, so deleting the constraint frees the walls again.
 
 - **Select** — drag a single corner (the wall stays rectangular and
-  follows via its hidden constraints), drag inside a wall to move the
-  whole rectangle, click a dimension line, angle arc or constraint badge
+  follows via its hidden constraints), drag inside a wall or rectangle to move
+  the shape, click a dimension line, angle arc or constraint badge
   to select a constraint; `Delete`/`Backspace` removes the selected wall
   or constraint.
+- **Rectangle** — choose **Rectangle** (`R`) and click opposite corners to
+  create an axis-aligned rectangle. Each rectangle starts with three editable
+  90° angle constraints. Select it and click **Save as symbol** in the toolbar;
+  enter a label, then choose **Place** in the Symbols sidebar and click where
+  the copy's center should be. Constraints on the symbol are shared by every
+  instance; resize or edit a shared constraint on any instance to update them
+  all. Select an instance and choose **Make independent rectangle** to detach
+  it and keep its constraints local.
+- **Wall path** (`P`) — click successive vertices to draw multiple walls with
+  corner joins; press Enter to close the polygon or double-click to finish an
+  open path. Segments share the toolbar thickness.
+- **Cut wall** (`X`) — click inside a wall to split it into two constrained
+  segments. Openings are retained and split if they cross the cut.
+- **Wall path** (`P`) — click path vertices to make connected wall segments;
+  press Enter to close a polygon or double-click to finish an open path. The
+  path interior is placed consistently to one side and corners join on the
+  outer side. Existing wall corners can be snapped into the path.
+- **Cut wall** (`X`) — click inside a wall to split it into two connected
+  segments. Existing openings and endpoint connections are preserved.
 - **Wall** — click two axis points; snapping to an existing vertex creates
   the coincident join. Every new wall automatically gets a thickness
   dimension between its two long edges, using the value in the toolbar

@@ -2,7 +2,7 @@ import math
 
 import pytest
 
-from archimple.model import Distance, Document
+from archimple.model import AngleBetween, Coincident, Distance, Document
 from archimple.solver import solve_document
 
 
@@ -113,6 +113,29 @@ def test_opening_handle_to_edge_dimension_moves_handle_along_host_axis():
     status = solve_document(doc, pinned=set(host.corners + target.corners))
     assert status.converged
     assert opening.start == pytest.approx(0.9, abs=1e-5)
+
+
+def test_rectangle_right_angle_constraints_remain_editable():
+    doc = Document()
+    rectangle = doc.add_rectangle(0, 0, 4, 3)
+    angles = [c for c in doc.constraints.values() if isinstance(c, AngleBetween)]
+    assert solve_document(doc).converged
+    doc.delete(angles[1].id)
+    angles.remove(angles[1])
+    doc.update_constraint(angles[0].id, 80)
+    assert angles[0].degrees == pytest.approx(80)
+    assert len(angles) == 2
+    doc.move_point(rectangle.corners[1], 4, 1)
+    status = solve_document(doc)
+    assert status.converged
+    p0, p1, p3 = (doc.points[rectangle.corners[i]] for i in (0, 1, 3))
+    first = (p1.x - p0.x, p1.y - p0.y)
+    second = (p3.x - p0.x, p3.y - p0.y)
+    angle = math.degrees(math.atan2(
+        first[0] * second[1] - first[1] * second[0],
+        first[0] * second[0] + first[1] * second[1],
+    ))
+    assert angle == pytest.approx(80, abs=1e-3)
 
 
 def test_distance_between_opening_handle_and_wall_axis_end():

@@ -30,7 +30,8 @@ archimple/
 │       └── app.js          the entire client (~1300 lines, vanilla JS, no build step)
 └── tests/
     ├── test_model.py       document model behaviour
-    └── test_solver.py      solver behaviour
+    ├── test_solver.py      solver behaviour
+    └── test_store.py       Hub operation dispatch and shared-state behaviour
 ```
 
 ## Running
@@ -43,10 +44,9 @@ uv run pytest                 # unit tests
 ```
 
 The server keeps everything in memory; there is no persistence. A fresh
-process starts with an empty document. Restarting the server reloads
-`app.js`/`index.html` — actually static files are served fresh on each
-page load, so client changes only need a browser hard-refresh, not a
-server restart (the server may keep running).
+process starts with an empty document. Static files are served fresh on each
+page load, so client-only changes need a browser hard-refresh. Python changes
+require a server restart; restarting also clears the in-memory document.
 
 ## Core conventions (read carefully)
 
@@ -77,6 +77,23 @@ server restart (the server may keep running).
 
 - `Point(id, name, x, y)` — points are wall corners; nothing else creates
   points.
+- `Rectangle(id, name, corners: [p0..p3], symbol)` — four independently
+  stored corner points. Rectangles may be rotated; never derive their local
+  dimensions from an axis-aligned bounding box.
+- `Symbol(id, label, width, height, constraints)` — instances share local
+  corner constraints and width/height, but each instance keeps its own centre
+  and orientation. A resize updates all siblings while preserving their
+  centres and orientations; translation and rotation affect only that instance.
+  Template refs use corner indices (`corner`, `start_corner`, `end_corner`)
+  and expand onto each instance's point IDs through
+  `Document.expanded_constraints()` before solving.
+- `Document.update_rectangle_corners(id, corners)` is the canonical update
+  path for rotated rectangle moves and resizes. It compares local side lengths
+  with shared symbol dimensions and propagates changed dimensions to sibling
+  instances. Keep translation/rotation separate from size propagation.
+- `Document.detach_rectangle(id)` removes one instance's symbol association
+  and materializes its current template constraints as ordinary constraints;
+  the symbol definition remains for other instances.
 - `Wall(id, name, corners: [c0..c3])` — **a wall is a rectangle** defined
   by four corner points laid around its axis:
   `c0 = start+` , `c1 = start−`, `c2 = end−`, `c3 = end+`, where `±` is
@@ -250,7 +267,27 @@ State/behaviour summary:
     at pointerup is forced. Do not remove the throttle; do not remove the
     forced final send either (the throttle would otherwise lose the last
     move).
-- Dimension tool: two picks of a **target** — corner (vertex ref) or wall
+  - Rectangle select behavior: prioritize corner-hit testing before generic
+    point dragging. A press within 12 px of a rectangle corner starts
+    `rectangle_resize`, including just outside the visible handle; never let
+    that press fall through to the point-constraint solver path. Press elsewhere
+    inside its polygon translates all four corners. Right-drag rotates around
+    the rectangle centre. Hit-test the actual quadrilateral, with a small edge
+    tolerance, not its AABB.
+  - Rectangle moves, resizes, and rotations send `update_rectangle_corners`
+    with all four world-space corners. Do not rebuild a rotated rectangle from
+    its axis-aligned bounds; that removes its orientation and inflates its size.
+  - Symbol resize preview uses a snapshot of every sibling's local axes and
+    centre captured at resize start. Recompute sibling preview corners from
+    that snapshot on each pointer move, draw them immediately, and retain the
+    preview across server broadcasts until pointerup. The server must propagate
+    shared sizes for both `update_rectangle_corners` and generic point `drag` /
+    `drag_end` paths, so resize never depends on a later click or selection.
+    Moving or rotating one instance must never translate siblings.
+  - Shared dimensions come from the resized instance's local side lengths;
+    all siblings resize in the same update while preserving their own centres
+    and orientations.
+  - Dimension tool: two picks of a **target** — corner (vertex ref) or wall
   edge (edge ref; hover within 7 px of an edge). Edge-edge requires
   near-parallel (±5°, enforced again server-side); value dialog prefills
   the current unsigned distance. Angle tool: pick two walls, dialog
@@ -291,9 +328,14 @@ State/behaviour summary:
      ~0.2 px (view offsets are captured at first resize). Angle/pivot
      assertions should tolerate ~0.01 m. For pure translation checks
      (pan), exactness holds.
-   - Prefer asserting on **server state via a websocket observer** rather
-     than canvas pixels; use the `window.__archimple` seam for client
-     internals.
+    - Prefer asserting on **server state via a websocket observer** rather
+      than canvas pixels; use the `window.__archimple` seam for client
+      internals. For live symbol resize, also inspect local render geometry
+      before pointerup; the server state alone does not prove preview timing.
+    - For live symbol resize, keep an immutable snapshot of every sibling's
+      axes/centre from resize start; recompute and draw the preview before
+      pointerup, and retain it across server broadcasts until release.
+
    - Collected JS errors via an injected `window.onerror` collector
      *before* interacting; but note a parse error kills the script before
      any collector — symptom: `window.__archimple is undefined`.
@@ -315,9 +357,22 @@ State/behaviour summary:
   tests when hunting such bugs.
 - **`Math.round(-0.5) === -0`/`-4` in JS** (rounds toward +∞ on .5) —
   don't assert exact `-0.5`-style expectations from snapped values.
+- **Symbol corner drags need early hit priority.** If a press near a rectangle
+  corner falls through to generic point dragging, the current rectangle may
+  resize via solver constraints without running `update_rectangle_corners`;
+  sibling symbols then fail to update. Test slightly outside the visible handle,
+  and keep server-side size propagation in the point-drag path as a fallback.
+- **Keep live symbol resize previews across state broadcasts.** Server echoes
+  replace `state`; derive sibling preview geometry from the immutable
+  resize-start snapshot, and keep it until the resize gesture ends.
+- Symbol resize has two live paths: explicit `update_rectangle_corners` and
+  generic point `drag`/`drag_end`. Keep server-side size propagation in both;
+  never require a later click/selection to update siblings. During a resize,
+  keep the local preview until release even when an incoming broadcast reports
+  temporarily matching dimensions.
 - The `id`-in-point-payload rule, the join fixed-point iteration, the
-  drag-snap exclusions, and the `#dialog[hidden]` CSS rule are all fixes
-  for real reported bugs — see the sections above for the reasoning.
+  drag-snap exclusions, `#dialog[hidden]`, and symbol resize propagation are
+  fixes for real reported bugs — preserve the behaviors described above.
 
 ## Sandbox notes (this development environment)
 

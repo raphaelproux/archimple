@@ -173,6 +173,15 @@ def _wall_hidden_rows(w, get) -> list[Row]:
     return rows
 
 
+def _line_pids(doc: Document, ref: dict) -> tuple[str, str] | None:
+    if ref["kind"] == "wall":
+        wall = doc.walls.get(ref["wall"])
+        return (wall.corners[0], wall.corners[3]) if wall else None
+    if ref["kind"] == "segment":
+        return ref["start"], ref["end"]
+    return None
+
+
 def _edge_pids(doc: Document, ref: dict) -> tuple[str, str] | None:
     w = doc.walls.get(ref["wall"])
     if w is None or len(w.corners) != 4:
@@ -263,7 +272,10 @@ def solve_document(
     pinned = set(pinned)
     free = [p for p in doc.points.values() if p.id not in pinned]
     point_index = {p.id: i for i, p in enumerate(free)}
-    opening_index = {oid: len(free) + i for i, oid in enumerate(doc.openings)}
+    opening_index = {
+        oid: len(free) + i
+        for i, oid in enumerate(doc.openings)
+    }
     n = 2 * (len(free) + len(opening_index))
 
     def pt(coords: np.ndarray):
@@ -328,7 +340,7 @@ def solve_document(
                     ])
                 rows.append((start + length - wall_length, derivs))
         # user constraints
-        for c in doc.constraints.values():
+        for c in doc.expanded_constraints():
             if isinstance(c, Coincident):
                 if c.a in doc.points and c.b in doc.points:
                     rows.extend(_coincident_rows(get(c.a), get(c.b), c.a, c.b))
@@ -373,23 +385,20 @@ def solve_document(
                             off,
                         ))
             elif isinstance(c, AngleBetween):
-                wa = doc.walls.get(c.wall_a)
-                wb = doc.walls.get(c.wall_b)
-                if wa and wb and all(
-                    pid in doc.points for pid in wa.corners + wb.corners
-                ):
+                endpoints_a = _line_pids(doc, c.a)
+                endpoints_b = _line_pids(doc, c.b)
+                if endpoints_a and endpoints_b:
+                    a1, a2 = endpoints_a
+                    b1, b2 = endpoints_b
                     rows.extend(_angle_rows(
-                        get(wa.corners[0]), get(wa.corners[3]),
-                        get(wb.corners[0]), get(wb.corners[3]),
-                        (wa.corners[0], wa.corners[3]),
-                        (wb.corners[0], wb.corners[3]),
-                        c.degrees))
+                        get(a1), get(a2), get(b1), get(b2),
+                        (a1, a2), (b1, b2), c.degrees))
             elif isinstance(c, (Horizontal, Vertical)):
-                w = doc.walls.get(c.wall)
-                if w and all(pid in doc.points for pid in (w.corners[0], w.corners[3])):
+                endpoints = _line_pids(doc, c.target)
+                if endpoints:
+                    a, b = endpoints
                     comp = 1 if isinstance(c, Horizontal) else 0
-                    rows.extend(_axis_rows(
-                        get(w.corners[0]), get(w.corners[3]), w.corners[0], w.corners[3], comp))
+                    rows.extend(_axis_rows(get(a), get(b), a, b, comp))
         m = len(rows)
         r = np.empty(m)
         J = np.zeros((m, n)) if want_jac else np.empty((m, 0))

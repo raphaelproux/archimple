@@ -12,18 +12,22 @@
     <div class="tools">
       <button data-tool="select" class="active" title="Select / drag (S)">&#9633; Select</button>
       <button data-tool="wall" title="Draw wall (W)">Wall</button>
+      <button data-tool="rectangle" title="Draw rectangle (R)">Rectangle</button>
+      <button data-tool="wall-path" title="Draw wall path (P)">Wall path</button>
+      <button data-tool="cut" title="Cut wall (X)">Cut wall</button>
       <button data-tool="opening" title="Draw opening (O)">Opening</button>
       <button data-tool="dim" title="Distance constraint (D)">Dimension</button>
       <button data-tool="angle" title="Angle constraint (A)">Angle</button>
       <button data-tool="coincident" title="Coincident points (C)">Coincident</button>
-      <button data-tool="horizontal" title="Horizontal wall (H)">Horizontal</button>
-      <button data-tool="vertical" title="Vertical wall (V)">Vertical</button>
+      <button data-tool="horizontal" title="Horizontal line (H)">Horizontal</button>
+      <button data-tool="vertical" title="Vertical line (V)">Vertical</button>
     </div>
     <div class="right">
       <label class="snaplabel">wall <input id="wall-thickness" value="0.2 m" autocomplete="off" spellcheck="false"></label>
       <label class="snaplabel"><input type="checkbox" id="show-constraints" checked> Constraints</label>
       <button id="unit-m" class="unit active">m</button>
       <button id="unit-cm" class="unit">cm</button>
+      <button id="save-symbol-btn" disabled title="Save the selected rectangle, or the latest one, as a reusable symbol">Save as symbol</button>
       <button id="solve-btn" title="Re-solve constraints">Solve</button>
     </div>
   </header>
@@ -39,11 +43,29 @@
           <button id="dialog-cancel">Cancel</button>
         </div>
       </div>
+      <div id="symbol-modal" hidden>
+        <label for="symbol-label">Symbol label</label>
+        <input id="symbol-label" type="text" autocomplete="off" spellcheck="false">
+        <div class="dialog-buttons">
+          <button id="symbol-save">Save symbol</button>
+          <button id="symbol-cancel">Cancel</button>
+        </div>
+      </div>
     </div>
     <aside>
-      <h2>Constraints</h2>
-      <ul id="constraint-list"></ul>
-      <div id="status"></div>
+      <div class="side-tabs" role="tablist" aria-label="Sidebar panels">
+        <button id="constraints-tab" class="side-tab active" role="tab" aria-selected="true" aria-controls="constraints-panel">Constraints</button>
+        <button id="symbols-tab" class="side-tab" role="tab" aria-selected="false" aria-controls="symbols-panel">Symbols</button>
+      </div>
+      <section id="constraints-panel" class="side-panel active" role="tabpanel" aria-labelledby="constraints-tab">
+        <h2>Constraints</h2>
+        <ul id="constraint-list"></ul>
+        <div id="status"></div>
+      </section>
+      <section id="symbols-panel" class="side-panel" role="tabpanel" aria-labelledby="symbols-tab" hidden>
+        <h2>Symbol library</h2>
+        <ul id="symbol-list"></ul>
+      </section>
     </aside>
   </main>
   <footer>

@@ -98,9 +98,9 @@ canvas {
 
 #hint.error { border-color: var(--err); color: var(--err); }
 
-#dialog[hidden] { display: none; }
+#dialog[hidden], #symbol-modal[hidden] { display: none; }
 
-#dialog {
+#dialog, #symbol-modal {
   position: absolute;
   top: 40%;
   left: 50%;
@@ -116,9 +116,9 @@ canvas {
   z-index: 10;
 }
 
-#dialog label { font-size: 13px; color: var(--muted); }
+#dialog label, #symbol-modal label { font-size: 13px; color: var(--muted); }
 
-#dialog input {
+#dialog input, #symbol-modal input {
   background: #12161d;
   color: var(--text);
   border: 1px solid var(--border);
@@ -128,7 +128,7 @@ canvas {
   width: 180px;
 }
 
-#dialog input:focus { outline: none; border-color: var(--accent); }
+#dialog input:focus, #symbol-modal input:focus { outline: none; border-color: var(--accent); }
 
 .dialog-buttons { display: flex; gap: 6px; justify-content: flex-end; }
 
@@ -149,7 +149,17 @@ aside h2 {
   margin: 4px 0 8px;
 }
 
-#constraint-list { list-style: none; margin: 0; padding: 0; }
+#constraint-list, #symbol-list { list-style: none; margin: 0; padding: 0; }
+
+.side-tabs { display: flex; gap: 4px; margin: 0 0 10px; }
+.side-tab { flex: 1; padding: 5px 6px; color: var(--muted); }
+.side-tab.active { color: var(--text); border-color: var(--accent); background: #2b3b52; }
+.side-panel[hidden] { display: none; }
+#symbol-list { margin-bottom: 12px; }
+
+#symbol-list li { display: flex; align-items: center; gap: 8px; padding: 5px 2px; font-size: 12px; }
+
+.symbol-save { width: 100%; margin: 5px 0 12px; }
 
 #constraint-list li {
   display: flex;
