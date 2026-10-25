@@ -50,6 +50,26 @@ class SolveStatus:
 Row = tuple[float, list[tuple[str, int, float]]]
 
 
+def _length_row(pa, pb, a: str, b: str, target: float) -> Row:
+    dx, dy = pb[0] - pa[0], pb[1] - pa[1]
+    length = math.hypot(dx, dy)
+    ux, uy = (1.0, 0.0) if length < 1e-9 else (dx / length, dy / length)
+    return length - target, [(a, 0, -ux), (a, 1, -uy), (b, 0, ux), (b, 1, uy)]
+
+
+def _orientation_row(pa, pb, a: str, b: str, target: float) -> Row:
+    dx, dy = pb[0] - pa[0], pb[1] - pa[1]
+    length2 = dx * dx + dy * dy
+    if length2 < 1e-18:
+        return 0.0, []
+    angle = math.atan2(dy, dx) - target
+    residual = math.atan2(math.sin(angle), math.cos(angle))
+    return residual, [
+        (a, 0, dy / length2), (a, 1, -dx / length2),
+        (b, 0, -dy / length2), (b, 1, dx / length2),
+    ]
+
+
 def _coincident_rows(pa, pb, a: str, b: str) -> list[Row]:
     (ax, ay), (bx, by) = pa, pb
     return [
@@ -268,6 +288,7 @@ def solve_document(
     pinned: tuple[str, ...] | set[str] = (),
     *,
     max_iter: int = 80,
+    preserve_lengths: dict[str, float] | None = None,
 ) -> SolveStatus:
     pinned = set(pinned)
     free = [p for p in doc.points.values() if p.id not in pinned]
@@ -292,7 +313,80 @@ def solve_document(
 
         return get, get_station
 
-    def evaluate(coords: np.ndarray, want_jac: bool) -> tuple[np.ndarray, np.ndarray]:
+    entity_preferences: list[tuple[str, list[tuple[str, str]], list[tuple[str, str]]]] = []
+    point_entities: dict[str, str] = {}
+    for wall in doc.walls.values():
+        if all(pid in doc.points for pid in wall.corners):
+            a, b = wall.corners[0], wall.corners[3]
+            entity_preferences.append((wall.id, [(a, b)], [(a, b)]))
+            for pid in wall.corners:
+                point_entities[pid] = wall.id
+    for rectangle in doc.rectangles.values():
+        if all(pid in doc.points for pid in rectangle.corners):
+            c = rectangle.corners
+            entity_preferences.append((rectangle.id, [(c[0], c[1]), (c[0], c[3])],
+                                       [(c[0], c[1]), (c[0], c[3])]))
+            for pid in c:
+                point_entities[pid] = rectangle.id
+    explicit_rotation: set[str] = set()
+    explicit_lengths: set[str] = set()
+    for constraint in doc.expanded_constraints():
+        if isinstance(constraint, AngleBetween):
+            for ref in (constraint.a, constraint.b):
+                if ref.get("kind") == "wall":
+                    explicit_rotation.add(ref["wall"])
+                elif ref.get("kind") == "segment":
+                    pair = {ref["start"], ref["end"]}
+                    for entity_id, rotation_axes, _ in entity_preferences:
+                        if any(pair == {a, b} for a, b in rotation_axes):
+                            explicit_rotation.add(entity_id)
+        elif isinstance(constraint, (Horizontal, Vertical)):
+            if constraint.target.get("kind") == "wall":
+                explicit_rotation.add(constraint.target["wall"])
+        elif isinstance(constraint, Distance):
+            refs = (constraint.a, constraint.b)
+            if all(ref.get("kind") == "vertex" for ref in refs):
+                pair = {refs[0]["pid"], refs[1]["pid"]}
+                for entity_id, _, length_axes in entity_preferences:
+                    if any(pair == {a, b} for a, b in length_axes):
+                        explicit_lengths.add(entity_id)
+            for ref in refs:
+                if ref.get("kind") == "vertex":
+                    entity_id = point_entities.get(ref["pid"])
+                    if entity_id:
+                        explicit_lengths.add(entity_id)
+                elif ref.get("kind") == "wall-end":
+                    explicit_lengths.add(ref["wall"])
+                elif ref.get("kind") in ("opening", "opening-length"):
+                    opening = doc.openings.get(ref["opening"])
+                    if opening:
+                        explicit_lengths.add(opening.wall)
+    directly_transformed: set[str] = {
+        entity_id
+        for entity_id, corners in [
+            *((wall.id, wall.corners) for wall in doc.walls.values()),
+            *((rectangle.id, rectangle.corners) for rectangle in doc.rectangles.values()),
+        ]
+        if any(pid in pinned for pid in corners)
+    }
+    preferences = []
+    for entity_id, rotation_axes, length_axes in entity_preferences:
+        if entity_id not in directly_transformed and entity_id not in explicit_rotation:
+            for a, b in rotation_axes:
+                pa, pb = doc.points[a], doc.points[b]
+                preferences.append(("rotation", a, b, math.atan2(pb.y - pa.y, pb.x - pa.x)))
+        if entity_id not in directly_transformed and entity_id not in explicit_lengths:
+            for a, b in length_axes:
+                pa, pb = doc.points[a], doc.points[b]
+                preferences.append(("length", a, b, math.hypot(pb.x - pa.x, pb.y - pa.y)))
+    for wall_id, target_length in (preserve_lengths or {}).items():
+        wall = doc.walls.get(wall_id)
+        if wall is not None:
+            preferences.append(("preserve_length", wall.corners[0], wall.corners[3], target_length))
+
+    def evaluate(
+        coords: np.ndarray, want_jac: bool
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
         get, get_station = pt(coords)
         rows: list[Row] = []
         # hidden per-wall constraints
@@ -399,11 +493,28 @@ def solve_document(
                     a, b = endpoints
                     comp = 1 if isinstance(c, Horizontal) else 0
                     rows.extend(_axis_rows(get(a), get(b), a, b, comp))
+        base_count = len(rows)
+        for kind, a, b, target in preferences:
+            pa, pb = get(a), get(b)
+            if kind == "rotation":
+                rows.append(_orientation_row(pa, pb, a, b, target))
+            else:
+                rows.append(_length_row(pa, pb, a, b, target))
         m = len(rows)
         r = np.empty(m)
+        weighted_r = np.empty(m)
         J = np.zeros((m, n)) if want_jac else np.empty((m, 0))
         for k, (res, derivs) in enumerate(rows):
+            factor = 1.0
+            if k >= base_count:
+                kind = preferences[k - base_count][0]
+                factor = math.sqrt(
+                    10000.0 if kind == "rotation"
+                    else 10000.0 if kind == "preserve_length"
+                    else 0.1
+                )
             r[k] = res
+            weighted_r[k] = res * factor
             if want_jac:
                 for pid, comp, val in derivs:
                     if pid.startswith("@"):
@@ -413,11 +524,11 @@ def solve_document(
                     else:
                         i = point_index.get(pid)
                     if i is not None:
-                        J[k, 2 * i + comp] += val
-        return r, J
+                        J[k, 2 * i + comp] += val * factor
+        return r, weighted_r, J, base_count
 
     if n == 0:
-        r, _ = evaluate(np.empty(0), False)
+        r, _, _, _ = evaluate(np.empty(0), False)
         max_res = float(np.max(np.abs(r))) if r.size else 0.0
         return SolveStatus(max_res < 1e-6, max_res, 0, int(r.size), 0, 0)
 
@@ -432,12 +543,12 @@ def solve_document(
 
     lam = 1e-3
     iterations = 0
-    r, J = evaluate(x, True)
-    cost = float(r @ r) if r.size else 0.0
+    r, weighted_r, J, base_count = evaluate(x, True)
+    cost = float(weighted_r @ weighted_r) if weighted_r.size else 0.0
     for iterations in range(1, max_iter + 1):
-        if r.size == 0 or float(np.max(np.abs(r))) < 1e-9:
+        if r.size == 0 or float(np.max(np.abs(weighted_r))) < 1e-9:
             break
-        g = J.T @ r
+        g = J.T @ weighted_r
         A = J.T @ J
         improved = False
         for _ in range(12):
@@ -453,12 +564,12 @@ def solve_document(
             if not np.all(np.isfinite(xn)):
                 lam *= 10.0
                 continue
-            rn, _ = evaluate(xn, False)
-            cn = float(rn @ rn)
+            rn, weighted_rn, _, _ = evaluate(xn, False)
+            cn = float(weighted_rn @ weighted_rn)
             if cn < cost:
                 x = xn
-                r, J = evaluate(x, True)
-                cost = float(r @ r)
+                r, weighted_r, J, base_count = evaluate(x, True)
+                cost = float(weighted_r @ weighted_r)
                 lam = max(lam / 3.0, 1e-12)
                 improved = True
                 break
@@ -474,7 +585,7 @@ def solve_document(
         doc.openings[oid].start = float(x[2 * i])
         doc.openings[oid].length = float(x[2 * i + 1])
 
-    max_res = float(np.max(np.abs(r))) if r.size else 0.0
+    max_res = float(np.max(np.abs(r[:base_count]))) if base_count else 0.0
     if J.size:
         try:
             with np.errstate(invalid="ignore"):

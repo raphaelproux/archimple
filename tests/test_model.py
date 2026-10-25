@@ -6,6 +6,27 @@ from archimple.model import AngleBetween, Coincident, Distance, Document, Horizo
 from archimple.solver import solve_document
 
 
+def test_document_round_trip_preserves_map_constraints_and_future_ids():
+    doc = Document()
+    wall = doc.add_wall((0, 0), (3, 0))
+    rectangle = doc.add_rectangle(4, 1, 6, 3)
+    symbol = doc.save_symbol(rectangle.id, "Desk")
+    doc.add_rectangle(8, 1, 10, 3, symbol=symbol.id)
+    serialized = doc.to_dict()
+
+    restored = Document.from_dict(serialized)
+
+    assert restored.to_dict() == serialized
+    assert restored.add_wall((0, 4), (2, 4)).id != wall.id
+    assert restored.add_rectangle(12, 1, 14, 3).id not in {item["id"] for item in serialized["rectangles"]}
+    assert restored.to_dict()["symbols"] == serialized["symbols"]
+
+
+def test_document_from_dict_rejects_invalid_data():
+    with pytest.raises(ValueError, match="missing required"):
+        Document.from_dict({})
+
+
 def test_add_rectangle_creates_standard_editable_right_angle_constraints():
     doc = Document()
     rectangle = doc.add_rectangle(4, 3, 1, 0)
@@ -109,6 +130,28 @@ def test_shared_constraint_delete_removes_template_for_every_instance():
     assert doc.delete(shared_id)
     assert shared_id not in symbol.constraints
     assert not any(c.id == shared_id for c in doc.expanded_constraints())
+
+
+def test_remove_symbol_keeps_instances_and_materializes_constraints():
+    doc = Document()
+    first = doc.add_rectangle(0, 0, 2, 1)
+    symbol = doc.save_symbol(first.id, "Desk")
+    second = doc.add_rectangle(5, 5, 7, 6, symbol=symbol.id)
+    first_point_ids = set(first.corners)
+    second_point_ids = set(second.corners)
+    assert len(symbol.constraints) == 3
+
+    assert doc.remove_symbol(symbol.id)
+
+    assert symbol.id not in doc.symbols
+    assert doc.rectangles[first.id] is first
+    assert doc.rectangles[second.id] is second
+    assert first.symbol is None and second.symbol is None
+    assert first_point_ids | second_point_ids <= set(doc.points)
+    assert len(doc.constraints) == 6
+    assert len(doc.expanded_constraints()) == 6
+    assert doc.to_dict()["symbols"] == []
+    assert not doc.remove_symbol(symbol.id)
 
 
 def test_constraints_added_to_symbol_instance_are_promoted_and_shared():
@@ -256,6 +299,8 @@ def test_wall_path_supports_clockwise_and_counterclockwise_polygons():
         doc = Document()
         walls = doc.add_wall_path(points, closed=True)
         assert len(walls) == 4
+        angles = [c for c in doc.constraints.values() if isinstance(c, AngleBetween)]
+        assert len(angles) == 3
         assert solve_document(doc).converged
 
 
@@ -269,26 +314,64 @@ def test_wall_path_builds_open_and_closed_polygons_and_rejects_zero_edges():
         doc.add_wall_path([(0, 0), (1, 0), (1, 0)])
 
 
-def test_cut_wall_retains_openings_and_references():
+def test_cut_wall_removes_axis_length_dimension_and_leaves_gap():
     doc = Document()
     wall = doc.add_wall((0, 0), (4, 0))
     opening = doc.add_opening(wall.id, 2.5, 3.5)
+    length_dimension, _ = doc.add_constraint({
+        "type": "distance",
+        "a": {"kind": "wall-end", "wall": wall.id, "end": "start"},
+        "b": {"kind": "wall-end", "wall": wall.id, "end": "end"},
+        "length": 4,
+    })
+
     first, second = doc.cut_wall(wall.id, 2)
+
     assert first.id == wall.id
-    assert opening.wall == second.id and opening.start == pytest.approx(0.5)
-    assert doc._wall_length(first.id) == pytest.approx(2)
-    assert doc._wall_length(second.id) == pytest.approx(2)
+    assert opening.wall == second.id and opening.start == pytest.approx(0.45)
+    assert doc._wall_length(first.id) == pytest.approx(1.95)
+    assert doc._wall_length(second.id) == pytest.approx(1.95)
+    first_axis = doc._axis_endpoints(first)
+    second_axis = doc._axis_endpoints(second)
+    assert math.dist(first_axis[2:], second_axis[:2]) == pytest.approx(0.1)
+    assert length_dimension.id not in doc.constraints
     thicknesses = [
         c for c in doc.constraints.values()
         if isinstance(c, Distance)
         and c.a.get("kind") == "edge"
         and c.b.get("kind") == "edge"
-        and c.a["wall"] in {first.id, second.id}
-        and c.b["wall"] == c.a["wall"]
+        and {c.a["wall"], c.b["wall"]} <= {first.id, second.id}
     ]
     assert len(thicknesses) == 2
+    assert {c.a["wall"] for c in thicknesses} == {first.id, second.id}
+    assert all(c.a["wall"] == c.b["wall"] for c in thicknesses)
     assert all(c.length == pytest.approx(0.2) for c in thicknesses)
+    assert not any(
+        isinstance(c, Distance)
+        and c.a.get("kind") == c.b.get("kind") == "edge"
+        and c.a["wall"] != c.b["wall"]
+        and {c.a["wall"], c.b["wall"]} == {first.id, second.id}
+        for c in doc.constraints.values()
+    )
     assert not any(isinstance(c, AngleBetween) for c in doc.constraints.values())
+    assert solve_document(doc).converged
+
+
+def test_cut_wall_splits_opening_around_gap():
+    doc = Document()
+    wall = doc.add_wall((0, 0), (4, 0))
+    opening = doc.add_opening(wall.id, 1.5, 2.5)
+
+    first, second = doc.cut_wall(wall.id, 2)
+
+    assert len(doc.openings) == 2
+    assert opening.wall == first.id
+    assert opening.start == pytest.approx(1.5)
+    assert opening.length == pytest.approx(0.45)
+    other = next(item for item in doc.openings.values() if item.id != opening.id)
+    assert other.wall == second.id
+    assert other.start == pytest.approx(0)
+    assert other.length == pytest.approx(0.45)
     assert solve_document(doc).converged
 
 

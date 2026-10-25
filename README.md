@@ -37,7 +37,8 @@ sharing a point, so deleting the constraint frees the walls again.
   the copy's center should be. Constraints on the symbol are shared by every
   instance; resize or edit a shared constraint on any instance to update them
   all. Select an instance and choose **Make independent rectangle** to detach
-  it and keep its constraints local.
+  it and keep its constraints local. Use the remove button beside a library
+  symbol to remove it while keeping placed rectangles as independent shapes.
 - **Wall path** (`P`) — click successive vertices to draw multiple walls with
   corner joins; press Enter to close the polygon or double-click to finish an
   open path. Segments share the toolbar thickness.
@@ -47,8 +48,9 @@ sharing a point, so deleting the constraint frees the walls again.
   press Enter to close a polygon or double-click to finish an open path. The
   path interior is placed consistently to one side and corners join on the
   outer side. Existing wall corners can be snapped into the path.
-- **Cut wall** (`X`) — click inside a wall to split it into two connected
-  segments. Existing openings and endpoint connections are preserved.
+- **Cut wall** (`X`) — click inside a wall to split it into two segments with
+  a 10 cm gap. Existing openings and endpoint connections are preserved; wall
+  axis-length dimensions are removed because the original wall no longer exists.
 - **Wall** — click two axis points; snapping to an existing vertex creates
   the coincident join. Every new wall automatically gets a thickness
   dimension between its two long edges, using the value in the toolbar
@@ -86,6 +88,10 @@ the visible grid — 10 cm at normal zoom, coarser when zoomed out. Corner
 snapping onto existing vertices always stays on, since that is how joins
 are made. `m`/`cm` switches the display unit (values are stored in
 metres internally). The **Solve** button re-runs the solver explicitly.
+**Save map** downloads a JSON file containing the map and its constraints;
+**Load map** replaces the shared document with the contents of a saved JSON
+file, and **Clear map** removes all content; both changes are broadcast to all
+connected clients.
 
 The status bar shows the cursor position, solver status and free degrees
 of freedom; the side panel lists all constraints (click to highlight,

@@ -254,6 +254,48 @@ def test_angle_closest_orientation_solves_short_way():
     assert abs(theta + 90) < 1e-3  # rotated 3°, not 183°
 
 
+def test_constraint_propagation_preserves_unconstrained_wall_rotation_and_length():
+    doc = Document()
+    driven = make_wall(doc, (0, 0), (3, 0))
+    joined = make_wall(
+        doc, (3, 0), (3, 2), joins=[{"corner": 0, "pid": driven.corners[3]}]
+    )
+    doc.add_constraint({
+        "type": "distance",
+        "a": {"kind": "vertex", "pid": driven.corners[0]},
+        "b": {"kind": "vertex", "pid": driven.corners[3]},
+        "length": 4,
+    })
+
+    status = solve_document(doc)
+    start = doc.points[joined.corners[0]]
+    end = doc.points[joined.corners[3]]
+    angle = math.atan2(end.y - start.y, end.x - start.x)
+    length = math.hypot(end.x - start.x, end.y - start.y)
+
+    assert status.converged
+    assert angle == pytest.approx(math.pi / 2, abs=1e-6)
+    assert length == pytest.approx(2, abs=1e-6)
+
+
+def test_explicit_length_constraint_can_resize_its_target_wall():
+    doc = Document()
+    wall = make_wall(doc, (0, 0), (3, 0))
+    doc.add_constraint({
+        "type": "distance",
+        "a": {"kind": "vertex", "pid": wall.corners[0]},
+        "b": {"kind": "vertex", "pid": wall.corners[3]},
+        "length": 4,
+    })
+
+    status = solve_document(doc)
+    start = doc.points[wall.corners[0]]
+    end = doc.points[wall.corners[3]]
+
+    assert status.converged
+    assert math.hypot(end.x - start.x, end.y - start.y) == pytest.approx(4, abs=1e-6)
+
+
 def test_joined_two_wall_room_solves():
     """A minimal room: four walls joined corner-to-corner via coincidents."""
     doc = Document()

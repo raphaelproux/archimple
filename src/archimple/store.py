@@ -73,14 +73,27 @@ class Hub:
         elif kind == "save_symbol":
             doc.save_symbol(op["id"], op["label"])
             self._solve()
+        elif kind == "remove_symbol":
+            doc.remove_symbol(op["id"])
+            self._solve()
         elif kind == "drag":
             points = op["points"]
             for pid, xy in points.items():
                 doc.move_point(pid, float(xy[0]), float(xy[1]))
-            self._solve(pinned=list(points), max_iter=25)
+            preserve_lengths = {
+                wall_id: float(length)
+                for wall_id, length in (op.get("preserve_lengths") or {}).items()
+            }
+            self._solve(
+                pinned=list(points), max_iter=25, preserve_lengths=preserve_lengths
+            )
             self._propagate_symbol_sizes(set(points))
         elif kind == "drag_end":
-            self._solve()
+            preserve_lengths = {
+                wall_id: float(length)
+                for wall_id, length in (op.get("preserve_lengths") or {}).items()
+            }
+            self._solve(preserve_lengths=preserve_lengths)
             self._propagate_symbol_sizes(set())
         elif kind == "add_opening":
             doc.add_opening(op["wall"], float(op["start"]), float(op["end"]))
@@ -97,13 +110,23 @@ class Hub:
         elif kind == "delete":
             doc.delete(op["id"])
             self._solve()
+        elif kind == "load":
+            loaded = Document.from_dict(op["document"])
+            status = solve_document(loaded).to_dict()
+            self.doc = loaded
+            self.status = status
         elif kind == "solve":
             self._solve()
         else:
             raise ValueError(f"unknown operation {kind!r}")
 
-    def _solve(self, pinned=(), max_iter: int = 80) -> None:
-        self.status = solve_document(self.doc, pinned=pinned, max_iter=max_iter).to_dict()
+    def _solve(self, pinned=(), max_iter: int = 80, preserve_lengths=None) -> None:
+        self.status = solve_document(
+            self.doc,
+            pinned=pinned,
+            max_iter=max_iter,
+            preserve_lengths=preserve_lengths,
+        ).to_dict()
 
     def _propagate_symbol_sizes(self, moved: set[str]) -> None:
         """Push a size change made by dragging points onto sibling instances."""

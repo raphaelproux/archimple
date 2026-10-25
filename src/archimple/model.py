@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 
 DEFAULT_THICKNESS = 0.2  # metres
+WALL_CUT_GAP = 0.1  # metres
 
 
 @dataclass
@@ -355,6 +357,16 @@ class Document:
             self.constraints[cid] = expanded
         rectangle.symbol = None
 
+    def remove_symbol(self, symbol_id: str) -> bool:
+        symbol = self.symbols.get(symbol_id)
+        if symbol is None:
+            return False
+        for rectangle in list(self.rectangles.values()):
+            if rectangle.symbol == symbol_id:
+                self.detach_rectangle(rectangle.id)
+        del self.symbols[symbol_id]
+        return True
+
     def update_rectangle(
         self, rectangle_id: str, x1: float, y1: float, x2: float, y2: float
     ) -> None:
@@ -556,7 +568,7 @@ class Document:
                 "b": following.corners[next_corner],
             })
         if closed and len(walls) > 1:
-            for index in range(len(walls)):
+            for index in range(len(walls) - 1):
                 first = (
                     points[(index + 1) % len(points)][0] - points[index][0],
                     points[(index + 1) % len(points)][1] - points[index][1],
@@ -604,7 +616,17 @@ class Document:
         if not 1e-3 < station < length - 1e-3:
             raise ValueError("cut position must be inside the wall")
         ux, uy = (end_x - start_x) / length, (end_y - start_y) / length
-        split = (start_x + ux * station, start_y + uy * station)
+        gap = min(WALL_CUT_GAP, station - 1e-3, length - station - 1e-3)
+        first_end_station = station - gap / 2
+        second_start_station = station + gap / 2
+        first_end = (
+            start_x + ux * first_end_station,
+            start_y + uy * first_end_station,
+        )
+        second_start = (
+            start_x + ux * second_start_station,
+            start_y + uy * second_start_station,
+        )
         thickness = math.hypot(
             self.points[wall.corners[1]].x - self.points[wall.corners[0]].x,
             self.points[wall.corners[1]].y - self.points[wall.corners[0]].y,
@@ -618,11 +640,21 @@ class Document:
         old_constraints = [
             c for c in self.constraints.values() if old_id in self._constraint_walls(c)
         ]
+        cut_length_constraints = {
+            c.id for c in old_constraints
+            if isinstance(c, Distance)
+            and c.a.get("kind") == c.b.get("kind") == "wall-end"
+            and c.a.get("wall") == c.b.get("wall") == old_id
+            and c.a.get("end") != c.b.get("end")
+        }
         for constraint in old_constraints:
             self.constraints.pop(constraint.id, None)
+        old_constraints = [
+            c for c in old_constraints if c.id not in cut_length_constraints
+        ]
         del self.walls[old_id]
-        first = self.add_wall((start_x, start_y), split, thickness)
-        second = self.add_wall(split, (end_x, end_y), thickness)
+        first = self.add_wall((start_x, start_y), first_end, thickness)
+        second = self.add_wall(second_start, (end_x, end_y), thickness)
         for segment in (first, second):
             segment_thickness = next(
                 constraint for constraint in self.constraints.values()
@@ -656,6 +688,16 @@ class Document:
             old_corners[3]: second.corners[3],
         }
         for constraint in old_constraints:
+            if not self._constraint_openings(constraint) <= self.openings.keys():
+                continue
+            if (
+                isinstance(constraint, Distance)
+                and constraint.a.get("kind") == "edge"
+                and constraint.b.get("kind") == "edge"
+                and constraint.a.get("wall") == old_id
+                and constraint.b.get("wall") == old_id
+            ):
+                continue
             if isinstance(constraint, Coincident):
                 constraint.a = start_corner_map.get(
                     constraint.a, end_corner_map.get(constraint.a, constraint.a)
@@ -669,6 +711,10 @@ class Document:
                     if ref.get("kind") == "vertex":
                         ref["pid"] = start_corner_map.get(
                             ref["pid"], end_corner_map.get(ref["pid"], ref["pid"])
+                        )
+                    elif ref.get("kind") == "wall-end" and ref.get("wall") == old_id:
+                        ref["wall"] = (
+                            first.id if ref["end"] == "start" else second_generated_id
                         )
                     elif ref.get("kind") == "edge" and ref.get("wall") == old_id:
                         ref["wall"] = first.id if ref["side"] > 0 else second.id
@@ -687,20 +733,31 @@ class Document:
                     constraint.target["wall"] = first.id
                 self.constraints[constraint.id] = constraint
         for opening in old_openings:
-            if opening.start + opening.length <= station:
+            opening_end = opening.start + opening.length
+            left_end = min(opening_end, first_end_station)
+            right_start = max(opening.start, second_start_station)
+            left_piece_length = max(0.0, left_end - opening.start)
+            right_piece_length = max(0.0, opening_end - right_start)
+            if left_piece_length and right_piece_length:
+                opening.length = left_piece_length
                 opening.wall = first.id
-            elif opening.start >= station:
-                opening.wall = second_generated_id
-                opening.start -= station
-            else:
-                first_piece_length = station - opening.start
-                second_piece_length = opening.start + opening.length - station
-                opening.length = first_piece_length
                 second_id, second_name = self._next("o")
                 self.openings[second_id] = Opening(
-                    second_id, second_name, second_generated_id, 0.0, second_piece_length
+                    second_id,
+                    second_name,
+                    second_generated_id,
+                    right_start - second_start_station,
+                    right_piece_length,
                 )
+            elif left_piece_length:
+                opening.length = left_piece_length
                 opening.wall = first.id
+            elif right_piece_length:
+                opening.wall = second_generated_id
+                opening.start = right_start - second_start_station
+                opening.length = right_piece_length
+            else:
+                self.delete(opening.id)
         return first, second
 
     def _wall_length(self, wall_id: str) -> float:
@@ -1153,6 +1210,127 @@ class Document:
 
     # -- serialisation -----------------------------------------------------
 
+    @classmethod
+    def from_dict(cls, data: dict) -> Document:
+        if not isinstance(data, dict):
+            raise ValueError("map file must contain a JSON object")
+        required = {"points", "walls", "openings", "rectangles", "symbols", "constraints"}
+        if not required.issubset(data):
+            raise ValueError("map file is missing required document data")
+        if not isinstance(data["points"], dict) or any(
+            not isinstance(data[key], list)
+            for key in ("walls", "openings", "rectangles", "symbols", "constraints")
+        ):
+            raise ValueError("invalid map file data")
+
+        doc = cls()
+        try:
+            for pid, point in data["points"].items():
+                if not isinstance(point, dict) or point.get("id") != pid:
+                    raise ValueError("invalid point data")
+                x, y = float(point["x"]), float(point["y"])
+                if not math.isfinite(x) or not math.isfinite(y):
+                    raise ValueError("point coordinates must be finite")
+                if pid in doc.points:
+                    raise ValueError("duplicate point id")
+                doc.points[pid] = Point(pid, str(point["name"]), x, y)
+
+            for item in data["walls"]:
+                wall = Wall(str(item["id"]), str(item["name"]), list(item["corners"]))
+                if wall.id in doc.walls:
+                    raise ValueError("duplicate wall id")
+                if len(wall.corners) != 4 or any(pid not in doc.points for pid in wall.corners):
+                    raise ValueError("invalid wall corners")
+                doc.walls[wall.id] = wall
+
+            for item in data["openings"]:
+                opening = Opening(
+                    str(item["id"]), str(item["name"]), str(item["wall"]),
+                    float(item["start"]), float(item["length"]),
+                )
+                if opening.id in doc.openings:
+                    raise ValueError("duplicate opening id")
+                if opening.wall not in doc.walls or not all(
+                    math.isfinite(value) for value in (opening.start, opening.length)
+                ) or opening.length <= 0:
+                    raise ValueError("invalid opening data")
+                doc.openings[opening.id] = opening
+
+            for item in data["rectangles"]:
+                rectangle = Rectangle(
+                    str(item["id"]), str(item["name"]), list(item["corners"]), item.get("symbol")
+                )
+                if rectangle.id in doc.rectangles:
+                    raise ValueError("duplicate rectangle id")
+                if len(rectangle.corners) != 4 or any(pid not in doc.points for pid in rectangle.corners):
+                    raise ValueError("invalid rectangle corners")
+                doc.rectangles[rectangle.id] = rectangle
+
+            for item in data["symbols"]:
+                symbol = Symbol(
+                    str(item["id"]), str(item["label"]), float(item["width"]),
+                    float(item["height"]),
+                )
+                if not all(math.isfinite(value) and value > 0 for value in (symbol.width, symbol.height)):
+                    raise ValueError("symbol dimensions must be positive and finite")
+                if symbol.id in doc.symbols:
+                    raise ValueError("duplicate symbol id")
+                for raw in item["constraints"]:
+                    constraint = _constraint_from_dict(raw, symbol=True)
+                    if constraint.id in symbol.constraints:
+                        raise ValueError("duplicate symbol constraint id")
+                    symbol.constraints[constraint.id] = constraint
+                if len(symbol.constraints) != len(item["constraints"]):
+                    raise ValueError("duplicate symbol constraint id")
+                doc.symbols[symbol.id] = symbol
+
+            for item in data["constraints"]:
+                constraint = _constraint_from_dict(item)
+                if constraint.id in doc.constraints:
+                    raise ValueError("duplicate constraint id")
+                doc.constraints[constraint.id] = constraint
+
+            constraint_ids = set(doc.constraints)
+            for symbol in doc.symbols.values():
+                if constraint_ids.intersection(symbol.constraints):
+                    raise ValueError("constraint ids must be unique")
+                constraint_ids.update(symbol.constraints)
+            if any(rectangle.symbol is not None and rectangle.symbol not in doc.symbols
+                   for rectangle in doc.rectangles.values()):
+                raise ValueError("rectangle references an unknown symbol")
+            if len(doc.points) != len(data["points"]):
+                raise ValueError("invalid point data")
+            for wall in doc.walls.values():
+                if len(set(wall.corners)) != 4:
+                    raise ValueError("wall corners must be distinct")
+            for rectangle in doc.rectangles.values():
+                if len(set(rectangle.corners)) != 4:
+                    raise ValueError("rectangle corners must be distinct")
+            for constraint in doc.expanded_constraints():
+                if isinstance(constraint, Coincident):
+                    if constraint.a not in doc.points or constraint.b not in doc.points:
+                        raise ValueError("constraint references an unknown point")
+                elif isinstance(constraint, Distance):
+                    doc._validate_ref(constraint.a)
+                    doc._validate_ref(constraint.b)
+                elif isinstance(constraint, AngleBetween):
+                    doc._validate_line_ref(constraint.a)
+                    doc._validate_line_ref(constraint.b)
+                else:
+                    doc._validate_line_ref(constraint.target)
+            doc._counters = {}
+            for item_id in (
+                [*doc.points, *doc.walls, *doc.openings, *doc.rectangles, *doc.symbols,
+                 *doc.constraints, *(cid for symbol in doc.symbols.values() for cid in symbol.constraints)]
+            ):
+                match = re.fullmatch(r"([a-z]+)_(\d+)", item_id)
+                if match:
+                    prefix, number = match.groups()
+                    doc._counters[prefix] = max(doc._counters.get(prefix, 0), int(number))
+        except (AttributeError, IndexError, KeyError, TypeError, OverflowError) as exc:
+            raise ValueError("invalid map file data") from exc
+        return doc
+
     def to_dict(self) -> dict:
         return {
             "points": {
@@ -1194,6 +1372,58 @@ class Document:
             ],
             "constraints": [_constraint_dict(c) for c in self.constraints.values()],
         }
+
+
+def _constraint_from_dict(data: dict, symbol: bool = False) -> Constraint:
+    if not isinstance(data, dict):
+        raise ValueError("invalid constraint data")
+    cid, name, ctype = str(data["id"]), str(data["name"]), data["type"]
+    if not isinstance(ctype, str):
+        raise ValueError("invalid constraint type")
+
+    if ctype == "coincident":
+        constraint = Coincident(cid, name, data["a"], data["b"])
+        if symbol and any(not isinstance(point, int) or not 0 <= point < 4 for point in (constraint.a, constraint.b)):
+            raise ValueError("invalid symbol corner reference")
+    elif ctype == "distance":
+        a, b = data["a"], data["b"]
+        if not isinstance(a, dict) or not isinstance(b, dict):
+            raise ValueError("invalid distance references")
+        if symbol and any(ref.get("kind") != "vertex" or not isinstance(ref.get("corner"), int)
+                          or not 0 <= ref["corner"] < 4 for ref in (a, b)):
+            raise ValueError("invalid symbol distance references")
+        length = float(data["length"])
+        offset = None if data.get("offset") is None else float(data["offset"])
+        if not math.isfinite(length) or length <= 0 or (offset is not None and not math.isfinite(offset)):
+            raise ValueError("invalid distance values")
+        constraint = Distance(cid, name, deepcopy(a), deepcopy(b), length, offset)
+    elif ctype == "angle":
+        a, b = data["a"], data["b"]
+        if not isinstance(a, dict) or not isinstance(b, dict):
+            raise ValueError("invalid angle references")
+        if symbol and any(ref.get("kind") != "segment" or not isinstance(ref.get("start_corner"), int)
+                          or not isinstance(ref.get("end_corner"), int)
+                          or not 0 <= ref["start_corner"] < 4 or not 0 <= ref["end_corner"] < 4
+                          for ref in (a, b)):
+            raise ValueError("invalid symbol angle references")
+        degrees = float(data["degrees"])
+        if not math.isfinite(degrees) or degrees < -180 or degrees > 180:
+            raise ValueError("invalid angle value")
+        constraint = AngleBetween(cid, name, deepcopy(a), deepcopy(b), degrees)
+    elif ctype in ("horizontal", "vertical"):
+        target = data["target"]
+        if not isinstance(target, dict):
+            raise ValueError("invalid constraint target")
+        if symbol and (target.get("kind") != "segment"
+                       or not isinstance(target.get("start_corner"), int)
+                       or not isinstance(target.get("end_corner"), int)
+                       or not 0 <= target["start_corner"] < 4
+                       or not 0 <= target["end_corner"] < 4):
+            raise ValueError("invalid symbol line reference")
+        constraint = (Horizontal if ctype == "horizontal" else Vertical)(cid, name, deepcopy(target))
+    else:
+        raise ValueError(f"unknown constraint type {ctype!r}")
+    return constraint
 
 
 def _constraint_dict(c: Constraint) -> dict:

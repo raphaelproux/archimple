@@ -1442,11 +1442,15 @@ function flash(msg) {
   }, 3500);
 }
 
-function sendDrag(pointsMap, force) {
+function sendDrag(pointsMap, force, preserveLengths) {
   const now = performance.now();
   if (!force && now - lastDragSend < 33) return;
   lastDragSend = now;
-  send({ op: "drag", points: pointsMap });
+  const op = { op: "drag", points: pointsMap };
+  if (preserveLengths && Object.keys(preserveLengths).length) {
+    op.preserve_lengths = preserveLengths;
+  }
+  send(op);
 }
 
 function updateHover(w) {
@@ -1712,7 +1716,12 @@ canvas.addEventListener("pointerdown", (e) => {
     }
     const p = pickPoint(w);
     if (p) {
-      drag = { mode: "point", id: p.id };
+      const owner = findWallByCorner(p.id);
+      const axis = owner ? wallAxis(owner) : null;
+      const preserveLengths = axis ? {
+        [owner.id]: Math.hypot(axis.bx - axis.ax, axis.by - axis.ay),
+      } : {};
+      drag = { mode: "point", id: p.id, preserveLengths };
       selection = null;
       return;
     }
@@ -1881,7 +1890,6 @@ canvas.addEventListener("pointerdown", (e) => {
             type: "distance", a: refOf(t1), b: refOf(t2), length: v,
           } });
         },
-        true,
       );
     }
     return;
@@ -1902,7 +1910,7 @@ canvas.addEventListener("pointerdown", (e) => {
       const degrees = Math.atan2(av.x * bv.y - av.y * bv.x, av.x * bv.x + av.y * bv.y) * 180 / Math.PI;
       openDialog("Angle (degrees)", fmtDeg(Math.abs(degrees)), parseAngle, value => {
         send({ op: "add_constraint", constraint: { type: "angle", a, b, degrees: value } });
-      }, true);
+      });
     }
     return;
   }
@@ -2009,15 +2017,9 @@ canvas.addEventListener("pointermove", (e) => {
 
   if (drag) {
     if (drag.mode === "point") {
-      // never snap the dragged point onto its own wall's corners or its
-      // coincident partners - that degenerates the rectangle
-      const exclude = coincidentSet(drag.id);
-      const own = findWallByCorner(drag.id);
-      if (own) for (const pid of own.corners) exclude.add(pid);
-      const s = snapWorld(w, exclude);
       const p = state.points[drag.id];
-      if (p) { p.x = s.x; p.y = s.y; }
-      sendDrag({ [drag.id]: [s.x, s.y] });
+      if (p) { p.x = w.x; p.y = w.y; }
+      sendDrag({ [drag.id]: [w.x, w.y] }, false, drag.preserveLengths);
     } else if (drag.mode === "rectangle" || drag.mode === "rectangle_resize") {
       const rectangle = (state.rectangles || []).find(item => item.id === drag.id);
       if (drag.mode === "rectangle") {
@@ -2110,7 +2112,7 @@ canvas.addEventListener("pointerup", (e) => {
       }
     } else if (drag.mode === "point") {
       const p = state.points[drag.id];
-      if (p) sendDrag({ [drag.id]: [p.x, p.y] }, true);
+      if (p) sendDrag({ [drag.id]: [p.x, p.y] }, true, drag.preserveLengths);
     } else if (drag.mode === "rectangle" || drag.mode === "rectangle_resize") {
       const points = drag.final || drag.orig;
       send({ op: "update_rectangle_corners", id: drag.id, corners: points.map(point => [point.x, point.y]) });
@@ -2141,7 +2143,11 @@ canvas.addEventListener("pointerup", (e) => {
       });
       sendDrag(map, true);
     }
-    send({ op: "drag_end" });
+    const endOp = { op: "drag_end" };
+    if (drag.mode === "point" && Object.keys(drag.preserveLengths || {}).length) {
+      endOp.preserve_lengths = drag.preserveLengths;
+    }
+    send(endOp);
     drag = null;
   }
 });
@@ -2173,17 +2179,24 @@ function zoomAt(px, py, factor) {
 let dialogSubmit = null;
 let dialogParse = null;
 
-function openDialog(labelText, value, parse, onSubmit, selectValue = false) {
+function openDialog(labelText, value, parse, onSubmit) {
   dialogSubmit = onSubmit;
   dialogParse = parse;
   dialogLabel.textContent = labelText;
   dialogInput.value = value;
   dialogEl.hidden = false;
-  requestAnimationFrame(() => {
+  const selectValue = () => {
     dialogInput.focus();
-    if (selectValue) dialogInput.setSelectionRange(0, dialogInput.value.length);
-  });
+    dialogInput.setSelectionRange(0, dialogInput.value.length, "forward");
+  };
+  selectValue();
+  requestAnimationFrame(() => requestAnimationFrame(selectValue));
+  setTimeout(selectValue, 50);
 }
+
+dialogInput.addEventListener("focus", () => {
+  dialogInput.setSelectionRange(0, dialogInput.value.length, "forward");
+});
 
 function editConstraint(c) {
   if (c.shared_symbol) {
@@ -2453,7 +2466,16 @@ function syncSymbolPanel() {
       setTool("rectangle");
       flash(`Place ${symbol.label}: click where its center should be`);
     });
-    li.append(name, place);
+    const remove = document.createElement("button");
+    remove.className = "cdel";
+    remove.textContent = "✕";
+    remove.title = "Remove symbol; keep placed rectangles as independent shapes";
+    remove.setAttribute("aria-label", `Remove symbol ${symbol.label}`);
+    remove.addEventListener("click", () => {
+      if (symbolPlacement?.id === symbol.id) symbolPlacement = null;
+      send({ op: "remove_symbol", id: symbol.id });
+    });
+    li.append(name, place, remove);
     symbolListEl.appendChild(li);
   }
 }
@@ -2554,6 +2576,49 @@ function setUnits(u) {
 unitM.addEventListener("click", () => setUnits("m"));
 unitCm.addEventListener("click", () => setUnits("cm"));
 document.getElementById("solve-btn").addEventListener("click", () => send({ op: "solve" }));
+document.getElementById("save-map-btn").addEventListener("click", () => {
+  const documentData = { ...state };
+  delete documentData.status;
+  const blob = new Blob([JSON.stringify(documentData, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "archimple-map.json";
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+});
+const loadMapButton = document.getElementById("load-map-btn");
+const loadMapInput = document.getElementById("load-map-input");
+loadMapButton.addEventListener("click", () => loadMapInput.click());
+loadMapInput.addEventListener("change", async () => {
+  const file = loadMapInput.files[0];
+  loadMapInput.value = "";
+  if (!file) return;
+  try {
+    const documentData = JSON.parse(await file.text());
+    if (!documentData || typeof documentData !== "object" || Array.isArray(documentData)) {
+      throw new Error("map file must contain a JSON object");
+    }
+    send({ op: "load", document: documentData });
+  } catch (error) {
+    flash(`could not load map: ${error.message}`);
+  }
+});
+document.getElementById("clear-map-btn").addEventListener("click", () => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    flash("not connected; map was not cleared");
+    return;
+  }
+  const emptyDocument = {
+    points: {},
+    walls: [],
+    openings: [],
+    rectangles: [],
+    symbols: [],
+    constraints: [],
+  };
+  send({ op: "load", document: emptyDocument });
+});
 
 /* ---------- resize ---------- */
 function resize() {
