@@ -301,6 +301,7 @@ def test_wall_path_supports_clockwise_and_counterclockwise_polygons():
         assert len(walls) == 4
         angles = [c for c in doc.constraints.values() if isinstance(c, AngleBetween)]
         assert len(angles) == 3
+        assert all(angle.preserve_orientation for angle in angles)
         assert solve_document(doc).converged
 
 
@@ -308,8 +309,26 @@ def test_wall_path_builds_open_and_closed_polygons_and_rejects_zero_edges():
     doc = Document()
     open_walls = doc.add_wall_path([(0, 0), (2, 0), (2, 2)])
     assert len(open_walls) == 2
+    open_angles = [
+        c for c in doc.constraints.values() if isinstance(c, AngleBetween)
+    ]
+    assert len(open_angles) == 1
+    assert open_angles[0].preserve_orientation
+    serialized_open_angle = next(
+        c for c in doc.to_dict()["constraints"] if c["type"] == "angle"
+    )
+    assert serialized_open_angle["preserve_orientation"]
+    restored = Document.from_dict(doc.to_dict())
+    restored_open_angle = next(
+        c for c in restored.constraints.values() if isinstance(c, AngleBetween)
+    )
+    assert restored_open_angle.preserve_orientation
     closed_walls = doc.add_wall_path([(4, 0), (6, 0), (6, 2), (4, 2)], closed=True)
     assert len(closed_walls) == 4
+    closed_angles = [
+        c for c in doc.constraints.values() if isinstance(c, AngleBetween)
+    ]
+    assert len(closed_angles) == 4
     with pytest.raises(ValueError):
         doc.add_wall_path([(0, 0), (1, 0), (1, 0)])
 

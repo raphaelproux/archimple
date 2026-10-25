@@ -218,6 +218,10 @@ footer {
 
 #coords { min-width: 220px; }
 
+.session-controls { display: flex; align-items: center; gap: 5px; }
+#session-code { color: var(--accent); letter-spacing: 1px; }
+#join-session-input { width: 110px; background: #12161d; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px; font: 12px ui-monospace, monospace; text-transform: uppercase; }
+
 #solver.ok { color: #7ec8a5; }
 #solver.bad { color: var(--err); }
 

@@ -1,15 +1,44 @@
-"""Shared document state for every connected client.
+"""Session-scoped document state shared by connected clients.
 
-One in-memory document is authoritative; every applied operation is
-followed by a solve and the full state is broadcast to all clients.
+Each in-memory session document is authoritative; every applied operation
+is followed by a solve and the full state is broadcast to that session.
 """
 
 from __future__ import annotations
 
 import asyncio
+import secrets
 
 from .model import DEFAULT_THICKNESS, Document
 from .solver import solve_document
+
+
+class SessionRegistry:
+    _alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+    def __init__(self) -> None:
+        self.sessions: dict[str, Hub] = {}
+
+    def create(self) -> tuple[str, Hub]:
+        while True:
+            code = "".join(secrets.choice(self._alphabet) for _ in range(10))
+            if code not in self.sessions:
+                hub = Hub()
+                self.sessions[code] = hub
+                return code, hub
+
+    def get(self, code: str) -> Hub:
+        normalized = code.strip().upper()
+        try:
+            return self.sessions[normalized]
+        except KeyError as exc:
+            raise ValueError("session code not found") from exc
+
+    def get_or_create(self, code: str | None = None) -> tuple[str, Hub]:
+        if code:
+            normalized = code.strip().upper()
+            return normalized, self.get(normalized)
+        return self.create()
 
 
 class Hub:
@@ -85,7 +114,10 @@ class Hub:
                 for wall_id, length in (op.get("preserve_lengths") or {}).items()
             }
             self._solve(
-                pinned=list(points), max_iter=25, preserve_lengths=preserve_lengths
+                pinned=[] if op.get("rotation") else list(points),
+                max_iter=25,
+                preserve_lengths=preserve_lengths,
+                rotating=op.get("rotating", ()),
             )
             self._propagate_symbol_sizes(set(points))
         elif kind == "drag_end":
@@ -102,8 +134,15 @@ class Hub:
             doc.update_opening(op["id"], float(op["start"]), float(op["end"]))
             self._solve()
         elif kind == "add_constraint":
+            snapshot = doc.to_dict()
+            previous_status = self.status
             doc.add_constraint(op["constraint"])
-            self._solve()
+            status = solve_document(doc).to_dict()
+            if status["rows"] > status["params"]:
+                self.doc = Document.from_dict(snapshot)
+                self.status = previous_status
+                raise ValueError("constraint would overconstrain the document")
+            self.status = status
         elif kind == "update_constraint":
             doc.update_constraint(op["id"], float(op["value"]))
             self._solve()
@@ -120,12 +159,15 @@ class Hub:
         else:
             raise ValueError(f"unknown operation {kind!r}")
 
-    def _solve(self, pinned=(), max_iter: int = 80, preserve_lengths=None) -> None:
+    def _solve(
+        self, pinned=(), max_iter: int = 80, preserve_lengths=None, rotating=()
+    ) -> None:
         self.status = solve_document(
             self.doc,
             pinned=pinned,
             max_iter=max_iter,
             preserve_lengths=preserve_lengths,
+            rotating=rotating,
         ).to_dict()
 
     def _propagate_symbol_sizes(self, moved: set[str]) -> None:

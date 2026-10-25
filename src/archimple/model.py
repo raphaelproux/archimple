@@ -86,6 +86,7 @@ class AngleBetween:
     a: dict
     b: dict
     degrees: float
+    preserve_orientation: bool = False
 
 
 @dataclass
@@ -537,6 +538,48 @@ class Document:
                 end[1] + side * end_offset[1] * thickness / 2,
             )
             axes.append((start_axis, end_axis))
+        join_count = len(segments) if closed else len(segments) - 1
+        for index in range(join_count):
+            next_index = (index + 1) % len(segments)
+            previous_direction = directions[index]
+            next_direction = directions[next_index]
+            previous_normal = normals[index]
+            next_normal = normals[next_index]
+            previous_sign = -1 if ccw else 1
+            next_sign = 1 if ccw else -1
+            previous_corner = (
+                axes[index][1][0] + previous_sign * thickness / 2 * previous_normal[0],
+                axes[index][1][1] + previous_sign * thickness / 2 * previous_normal[1],
+            )
+            next_corner = (
+                axes[next_index][0][0] + next_sign * thickness / 2 * next_normal[0],
+                axes[next_index][0][1] + next_sign * thickness / 2 * next_normal[1],
+            )
+            cross = (
+                previous_direction[0] * next_direction[1]
+                - previous_direction[1] * next_direction[0]
+            )
+            delta = (
+                next_corner[0] - previous_corner[0],
+                next_corner[1] - previous_corner[1],
+            )
+            distance = (
+                delta[0] * next_direction[1] - delta[1] * next_direction[0]
+            ) / cross
+            intersection = (
+                previous_corner[0] + distance * previous_direction[0],
+                previous_corner[1] + distance * previous_direction[1],
+            )
+            previous_end = (
+                intersection[0] - previous_sign * thickness / 2 * previous_normal[0],
+                intersection[1] - previous_sign * thickness / 2 * previous_normal[1],
+            )
+            next_start = (
+                intersection[0] - next_sign * thickness / 2 * next_normal[0],
+                intersection[1] - next_sign * thickness / 2 * next_normal[1],
+            )
+            axes[index] = (axes[index][0], previous_end)
+            axes[next_index] = (next_start, axes[next_index][1])
         for index, ((start_axis, end_axis), (start, end)) in enumerate(
             zip(axes, segments)
         ):
@@ -567,7 +610,7 @@ class Document:
                 "a": previous.corners[prev_corner],
                 "b": following.corners[next_corner],
             })
-        if closed and len(walls) > 1:
+        if len(walls) > 1:
             for index in range(len(walls) - 1):
                 first = (
                     points[(index + 1) % len(points)][0] - points[index][0],
@@ -586,6 +629,7 @@ class Document:
                     "a": {"kind": "wall", "wall": walls[index].id},
                     "b": {"kind": "wall", "wall": walls[(index + 1) % len(walls)].id},
                     "degrees": angle,
+                    "preserve_orientation": True,
                 })
         return walls
 
@@ -992,7 +1036,10 @@ class Document:
             theta = self._signed_line_angle(ra, rb)
             value = -value if theta < 0 else value
             cid, name = self._next("a")
-            c = AngleBetween(cid, name, ra, rb, value)
+            c = AngleBetween(
+                cid, name, ra, rb, value,
+                bool(data.get("preserve_orientation", False)),
+            )
         elif ctype == "coincident":
             a, b = data["a"], data["b"]
             if a not in self.points or b not in self.points:
@@ -1116,6 +1163,7 @@ class Document:
         elif isinstance(c, AngleBetween):
             sign = -1.0 if c.degrees < 0 else 1.0
             c.degrees = sign * _fold_angle(value)
+            c.preserve_orientation = False
         else:
             raise ValueError("this constraint has no editable value")
 
@@ -1409,7 +1457,10 @@ def _constraint_from_dict(data: dict, symbol: bool = False) -> Constraint:
         degrees = float(data["degrees"])
         if not math.isfinite(degrees) or degrees < -180 or degrees > 180:
             raise ValueError("invalid angle value")
-        constraint = AngleBetween(cid, name, deepcopy(a), deepcopy(b), degrees)
+        constraint = AngleBetween(
+            cid, name, deepcopy(a), deepcopy(b), degrees,
+            bool(data.get("preserve_orientation", False)),
+        )
     elif ctype in ("horizontal", "vertical"):
         target = data["target"]
         if not isinstance(target, dict):
@@ -1447,6 +1498,7 @@ def _constraint_dict(c: Constraint) -> dict:
             "a": c.a,
             "b": c.b,
             "degrees": round(c.degrees, 4),
+            **({"preserve_orientation": True} if c.preserve_orientation else {}),
         }
     if isinstance(c, Horizontal):
         return {"id": c.id, "name": c.name, "type": "horizontal", "target": c.target}

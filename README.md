@@ -1,21 +1,24 @@
 # archimple
 
 A web-based, CAD-flavoured floor-plan sketcher: draw walls, then constrain
-them with dimensions, angles and coincident points. The geometry and the
-constraint solver live in Python; the browser client is a thin canvas UI
+them with dimensions, angles and coincident points. The geometry and
+constraint assembly live in Python; a Rust extension accelerates the
+Levenberg–Marquardt numerical kernel. The browser client is a thin canvas UI
 kept in sync over a WebSocket, so any number of browsers can work on the
 same plan from one server.
 
 ## Run it
 
 ```sh
-uv sync
+uv sync                      # requires Rust/Cargo to build the extension
 uv run archimple            # http://127.0.0.1:8765
 uv run archimple --host 0.0.0.0 --port 9000   # serve your LAN
 ```
 
-Open the printed URL in one or more browser tabs/windows — every client
-shares the same document and sees each other's edits live.
+Open the printed URL to start a private session. The session code appears in
+the footer; share it with collaborators, who can enter it in the footer to join
+the same document. Reconnecting browsers return to their previous session.
+Sessions are in-memory and disappear when the server restarts.
 
 ## Using the editor
 
@@ -102,11 +105,10 @@ of freedom; the side panel lists all constraints (click to highlight,
 ```
 src/archimple/
   model.py     document model: points, rectangular walls, constraints
-  solver.py    Levenberg–Marquardt solver with analytic Jacobians; hidden
-               per-wall constraints keep walls rectangular and thickness
-               non-negative
-  store.py     shared document + client registry, applies client ops
-  server.py    FastAPI: /ws WebSocket + static files
+  solver.py    Levenberg–Marquardt solver and analytic Jacobian assembly
+  _native      Rust/PyO3 normal-equation assembly and damped linear solve
+  store.py     session registry and per-session document/client hubs
+  server.py    FastAPI: session-scoped /ws WebSocket + static files
   static/      single-page canvas client (vanilla JS, no build step)
 ```
 
@@ -117,8 +119,12 @@ Dimension constraints can reference a vertex (corner point), an edge
 (a wall side), or an opening handle; edge dimensions are signed distances
 and a wall's two long edges give its thickness.
 
-## Tests
+## Build and tests
+
+Building the package compiles the Rust extension and requires Rust/Cargo:
 
 ```sh
+uv sync
+uv build
 uv run pytest
 ```

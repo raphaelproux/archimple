@@ -15,6 +15,13 @@ from dataclasses import dataclass
 
 import numpy as np
 
+try:
+    from ._native import normal_equations as _native_normal_equations
+    from ._native import solve_damped as _native_solve_damped
+except ImportError:
+    _native_normal_equations = None
+    _native_solve_damped = None
+
 from .model import (
     AngleBetween,
     Coincident,
@@ -289,8 +296,10 @@ def solve_document(
     *,
     max_iter: int = 80,
     preserve_lengths: dict[str, float] | None = None,
+    rotating: set[str] | tuple[str, ...] = (),
 ) -> SolveStatus:
     pinned = set(pinned)
+    rotating = set(rotating)
     free = [p for p in doc.points.values() if p.id not in pinned]
     point_index = {p.id: i for i, p in enumerate(free)}
     opening_index = {
@@ -329,17 +338,25 @@ def solve_document(
             for pid in c:
                 point_entities[pid] = rectangle.id
     explicit_rotation: set[str] = set()
+    preserve_rotation: set[str] = set()
     explicit_lengths: set[str] = set()
     for constraint in doc.expanded_constraints():
         if isinstance(constraint, AngleBetween):
-            for ref in (constraint.a, constraint.b):
-                if ref.get("kind") == "wall":
-                    explicit_rotation.add(ref["wall"])
-                elif ref.get("kind") == "segment":
-                    pair = {ref["start"], ref["end"]}
-                    for entity_id, rotation_axes, _ in entity_preferences:
-                        if any(pair == {a, b} for a, b in rotation_axes):
-                            explicit_rotation.add(entity_id)
+            if constraint.preserve_orientation:
+                preserve_rotation.update(
+                    ref["wall"]
+                    for ref in (constraint.a, constraint.b)
+                    if ref.get("kind") == "wall"
+                )
+            else:
+                for ref in (constraint.a, constraint.b):
+                    if ref.get("kind") == "wall":
+                        explicit_rotation.add(ref["wall"])
+                    elif ref.get("kind") == "segment":
+                        pair = {ref["start"], ref["end"]}
+                        for entity_id, rotation_axes, _ in entity_preferences:
+                            if any(pair == {a, b} for a, b in rotation_axes):
+                                explicit_rotation.add(entity_id)
         elif isinstance(constraint, (Horizontal, Vertical)):
             if constraint.target.get("kind") == "wall":
                 explicit_rotation.add(constraint.target["wall"])
@@ -371,7 +388,9 @@ def solve_document(
     }
     preferences = []
     for entity_id, rotation_axes, length_axes in entity_preferences:
-        if entity_id not in directly_transformed and entity_id not in explicit_rotation:
+        if entity_id not in directly_transformed and entity_id not in rotating and (
+            entity_id in preserve_rotation or entity_id not in explicit_rotation
+        ):
             for a, b in rotation_axes:
                 pa, pb = doc.points[a], doc.points[b]
                 preferences.append(("rotation", a, b, math.atan2(pb.y - pa.y, pb.x - pa.x)))
@@ -513,6 +532,8 @@ def solve_document(
                     else 10000.0 if kind == "preserve_length"
                     else 0.1
                 )
+                if kind != "preserve_length":
+                    factor *= 0.01
             r[k] = res
             weighted_r[k] = res * factor
             if want_jac:
@@ -548,18 +569,30 @@ def solve_document(
     for iterations in range(1, max_iter + 1):
         if r.size == 0 or float(np.max(np.abs(weighted_r))) < 1e-9:
             break
-        g = J.T @ weighted_r
-        A = J.T @ J
+        if _native_normal_equations is None:
+            g = J.T @ weighted_r
+            A = J.T @ J
+        else:
+            A, g = _native_normal_equations(J, weighted_r)
         improved = False
         for _ in range(12):
             if lam > 1e14:
                 break
             scale = np.maximum(np.diag(A), 1e-8)
             H = A + lam * np.diag(scale)
-            try:
-                dx = np.linalg.solve(H, -g)
-            except np.linalg.LinAlgError:
-                dx = np.linalg.lstsq(H, -g, rcond=None)[0]
+            if _native_solve_damped is None:
+                try:
+                    dx = np.linalg.solve(H, -g)
+                except np.linalg.LinAlgError:
+                    dx = np.linalg.lstsq(H, -g, rcond=None)[0]
+            else:
+                try:
+                    dx = _native_solve_damped(H, -g)
+                except ValueError:
+                    try:
+                        dx = np.linalg.solve(H, -g)
+                    except np.linalg.LinAlgError:
+                        dx = np.linalg.lstsq(H, -g, rcond=None)[0]
             xn = x + dx
             if not np.all(np.isfinite(xn)):
                 lam *= 10.0

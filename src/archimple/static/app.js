@@ -19,6 +19,9 @@ const symbolLabelInput = document.getElementById("symbol-label");
 const symbolSaveButton = document.getElementById("symbol-save");
 const symbolCancelButton = document.getElementById("symbol-cancel");
 const saveSymbolButton = document.getElementById("save-symbol-btn");
+const sessionCodeEl = document.getElementById("session-code");
+const joinSessionInput = document.getElementById("join-session-input");
+const joinSessionButton = document.getElementById("join-session-btn");
 
 /* ---------- state ---------- */
 let state = { points: {}, walls: [], openings: [], rectangles: [], symbols: [], constraints: [], status: null };
@@ -48,20 +51,35 @@ let dpr = window.devicePixelRatio || 1;
 
 /* ---------- websocket ---------- */
 let ws = null;
+let reconnectTimer = null;
 let lastDragSend = 0;
 let hintTimer = null;
+let sessionCode = new URLSearchParams(location.search).get("session") || sessionStorage.getItem("archimple-session") || "";
+let reconnectEnabled = true;
 
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  const query = sessionCode ? `?session=${encodeURIComponent(sessionCode)}` : "";
+  ws = new WebSocket(`${proto}://${location.host}/ws${query}`);
   ws.onopen = () => { connEl.textContent = "connected"; connEl.className = ""; };
   ws.onclose = () => {
-    connEl.textContent = "disconnected — retrying";
+    connEl.textContent = reconnectEnabled ? "disconnected — retrying" : "disconnected";
     connEl.className = "off";
-    setTimeout(connect, 1000);
+    if (reconnectEnabled) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(connect, 1000);
+    }
   };
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
+    if (msg.op === "session") {
+      sessionCode = msg.code;
+      sessionStorage.setItem("archimple-session", sessionCode);
+      reconnectEnabled = true;
+
+      sessionCodeEl.textContent = sessionCode;
+      return;
+    }
     if (msg.points) {
       state = msg;
       if (pendingMeasurementsRestore) {
@@ -120,6 +138,13 @@ function connect() {
       pendingSymbolSave = null;
       pendingMeasurementsRestore = null;
       flash(msg.message);
+      if (msg.session) {
+        sessionCode = "";
+        sessionStorage.removeItem("archimple-session");
+        reconnectEnabled = false;
+        sessionCodeEl.textContent = "—";
+        joinSessionInput.value = "";
+      }
     }
   };
 }
@@ -127,6 +152,47 @@ function connect() {
 function send(op) {
   if (ws && ws.readyState === 1) ws.send(JSON.stringify(op));
 }
+
+function switchSession(code) {
+  sessionCode = code;
+  if (code) sessionStorage.setItem("archimple-session", code);
+  else sessionStorage.removeItem("archimple-session");
+  reconnectEnabled = true;
+  sessionCodeEl.textContent = code || "creating…";
+  clearTimeout(reconnectTimer);
+  if (ws) {
+    ws.onclose = null;
+    ws.onmessage = null;
+    ws.onerror = null;
+    ws.close();
+  }
+  connect();
+}
+
+function joinSession() {
+  const code = joinSessionInput.value.trim().toUpperCase();
+  if (!/^[A-HJ-NP-Z2-9]{10}$/.test(code)) {
+    flash("Enter a valid 10-character session code");
+    return;
+  }
+  switchSession(code);
+}
+
+document.getElementById("copy-session-btn").addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText(sessionCode);
+    flash("Session code copied");
+  } catch (_) {
+    joinSessionInput.value = sessionCode;
+    joinSessionInput.select();
+    flash("Select and copy the session code");
+  }
+});
+joinSessionButton.addEventListener("click", joinSession);
+document.getElementById("new-session-btn").addEventListener("click", () => switchSession(""));
+joinSessionInput.addEventListener("keydown", event => {
+  if (event.key === "Enter") joinSession();
+});
 
 function indexState() {
   wallsById = {};
@@ -1339,38 +1405,83 @@ function drawPreview() {
     }
   }
   if (tool === "wall-path" && pending.length && mouse.inside) {
+    const drawSegments = (vertices, closed, lastOnly = false) => {
+      const segments = vertices.slice(1).map((point, index) => [vertices[index], point]);
+      if (closed) segments.push([vertices[vertices.length - 1], vertices[0]]);
+      if (!segments.length || segments.some(([a, b]) => Math.hypot(b.x - a.x, b.y - a.y) < 1e-6)) return;
+      const normals = segments.map(([a, b]) => {
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const length = Math.hypot(dx, dy);
+        return { x: -dy / length, y: dx / length };
+      });
+      let side = 1;
+      if (closed) {
+        const area = vertices.reduce((sum, point, index) => {
+          const next = vertices[(index + 1) % vertices.length];
+          return sum + point.x * next.y - next.x * point.y;
+        }, 0);
+        side = area >= 0 ? 1 : -1;
+      }
+      const half = wallThickness / 2;
+      const axes = segments.map(([start, end], index) => {
+        const previousIndex = (index - 1 + segments.length) % segments.length;
+        let startOffset;
+        if (index === 0 && !closed) {
+          startOffset = normals[index];
+        } else {
+          const previous = normals[previousIndex], next = normals[index];
+          const nx = previous.x + next.x, ny = previous.y + next.y;
+          const dot = nx * next.x + ny * next.y;
+          startOffset = { x: nx / (dot || 1), y: ny / (dot || 1) };
+        }
+        const nextIndex = (index + 1) % segments.length;
+        let endOffset;
+        if (nextIndex === 0 && !closed) {
+          endOffset = normals[index];
+        } else {
+          const next = normals[nextIndex];
+          const nx = normals[index].x + next.x, ny = normals[index].y + next.y;
+          const dot = nx * normals[index].x + ny * normals[index].y;
+          endOffset = { x: nx / (dot || 1), y: ny / (dot || 1) };
+        }
+        return [
+          { x: start.x + side * startOffset.x * half, y: start.y + side * startOffset.y * half },
+          { x: end.x + side * endOffset.x * half, y: end.y + side * endOffset.y * half },
+        ];
+      });
+      ctx.lineWidth = 1.5;
+      const firstIndex = lastOnly ? axes.length - 1 : 0;
+      for (let index = firstIndex; index < axes.length; index++) {
+        const [start, end] = axes[index];
+        const normal = normals[index];
+        const quad = [
+          { x: start.x + half * normal.x, y: start.y + half * normal.y },
+          { x: start.x - half * normal.x, y: start.y - half * normal.y },
+          { x: end.x - half * normal.x, y: end.y - half * normal.y },
+          { x: end.x + half * normal.x, y: end.y + half * normal.y },
+        ].map(point => toScreen(point.x, point.y));
+        ctx.beginPath();
+        ctx.moveTo(quad[0].x, quad[0].y);
+        for (const point of quad.slice(1)) ctx.lineTo(point.x, point.y);
+        ctx.closePath();
+        ctx.fillStyle = lastOnly
+          ? "rgba(176,226,255,0.2)"
+          : "rgba(108,208,255,0.16)";
+        ctx.fill();
+        ctx.strokeStyle = lastOnly
+          ? "rgba(176,226,255,0.95)"
+          : "rgba(108,208,255,0.8)";
+        ctx.setLineDash(lastOnly ? [5, 4] : []);
+        ctx.stroke();
+      }
+      ctx.setLineDash([]);
+    };
     const vertices = pending.map(point => ({ x: point.x, y: point.y }));
     vertices.push(snapWorld({ x: mouse.wx, y: mouse.wy }));
-    const normals = [];
-    for (let index = 0; index < vertices.length - 1; index++) {
-      const a = vertices[index], b = vertices[index + 1];
-      const dx = b.x - a.x, dy = b.y - a.y;
-      const length = Math.hypot(dx, dy) || 1;
-      normals.push({ x: -dy / length, y: dx / length });
+    drawSegments(vertices, false);
+    if (pending.length >= 3) {
+      drawSegments(pending.map(point => ({ x: point.x, y: point.y })), true, true);
     }
-    const area = vertices.slice(0, -1).reduce((sum, point, index) => {
-      const next = vertices[index + 1];
-      return sum + point.x * next.y - next.x * point.y;
-    }, 0);
-    const side = area >= 0 ? 1 : -1;
-    const offsetPoints = vertices.map((vertex, index) => {
-      const previous = normals[Math.max(0, index - 1)];
-      const next = normals[Math.min(normals.length - 1, index)];
-      let nx = previous.x + next.x, ny = previous.y + next.y;
-      const norm = Math.hypot(nx, ny) || 1;
-      nx /= norm;
-      ny /= norm;
-      const denom = Math.abs(nx * next.x + ny * next.y) || 1;
-      const distance = side * wallThickness / 2 / denom;
-      return toScreen(vertex.x + nx * distance, vertex.y + ny * distance);
-    });
-    ctx.strokeStyle = "rgba(108,208,255,0.8)";
-    ctx.setLineDash([5, 4]);
-    ctx.lineWidth = 1.5;
-    for (let index = 0; index < offsetPoints.length - 1; index++) {
-      line2(offsetPoints[index], offsetPoints[index + 1]);
-    }
-    ctx.setLineDash([]);
   }
   if (tool === "cut" && mouse.inside) {
     const wall = pickWall({ x: mouse.wx, y: mouse.wy });
@@ -1647,7 +1758,7 @@ function flash(msg) {
   }, 3500);
 }
 
-function sendDrag(pointsMap, force, preserveLengths) {
+function sendDrag(pointsMap, force, preserveLengths, rotation = false, rotating = []) {
   const now = performance.now();
   if (!force && now - lastDragSend < 33) return;
   lastDragSend = now;
@@ -1655,6 +1766,8 @@ function sendDrag(pointsMap, force, preserveLengths) {
   if (preserveLengths && Object.keys(preserveLengths).length) {
     op.preserve_lengths = preserveLengths;
   }
+  if (rotation) op.rotation = true;
+  if (rotating.length) op.rotating = rotating;
   send(op);
 }
 
@@ -2250,7 +2363,7 @@ canvas.addEventListener("pointermove", (e) => {
           send({ op: "update_rectangle_corners", id: rotate.id, corners: rotated });
         }
       } else {
-        sendDrag(map);
+        sendDrag(map, false, null, true, [rotate.id]);
       }
 
     draw();
@@ -2346,7 +2459,7 @@ canvas.addEventListener("pointerup", (e) => {
     if (rotate.kind === "rectangle") {
       send({ op: "update_rectangle_corners", id: rotate.id, corners: points });
     } else {
-      sendDrag(map, true);
+      sendDrag(map, true, null, true, [rotate.id]);
     }
     send({ op: "drag_end" });
     rotate = null;

@@ -2,6 +2,7 @@ import math
 
 import pytest
 
+from archimple import solver
 from archimple.model import AngleBetween, Coincident, Distance, Document
 from archimple.solver import solve_document
 
@@ -13,6 +14,54 @@ def make_wall(doc, start, end, t=0.2, joins=()):
 def test_empty_document_converges():
     st = solve_document(Document())
     assert st.converged and st.rows == 0
+
+
+def test_native_and_numpy_solver_paths_agree():
+    if solver._native_normal_equations is None or solver._native_solve_damped is None:
+        pytest.skip("native extension is not built")
+    doc = Document()
+    wall = make_wall(doc, (0, 0), (3, 0.05))
+    doc.add_constraint({
+        "type": "distance",
+        "a": {"kind": "vertex", "pid": wall.corners[0]},
+        "b": {"kind": "vertex", "pid": wall.corners[3]},
+        "length": 4,
+    })
+    native_eq = solver._native_normal_equations
+    native_solve = solver._native_solve_damped
+    try:
+        native_status = solve_document(doc)
+        native_positions = [(p.x, p.y) for p in doc.points.values()]
+        solver._native_normal_equations = None
+        solver._native_solve_damped = None
+        python_status = solve_document(doc)
+        python_positions = [(p.x, p.y) for p in doc.points.values()]
+    finally:
+        solver._native_normal_equations = native_eq
+        solver._native_solve_damped = native_solve
+    assert native_status.converged == python_status.converged
+    assert native_status.params == python_status.params
+    assert native_status.rows == python_status.rows
+    assert native_status.dofs == python_status.dofs
+    assert native_status.max_residual == pytest.approx(python_status.max_residual, abs=1e-8)
+    assert native_positions == pytest.approx(python_positions, abs=1e-6)
+
+
+def test_closed_path_with_length_constraint_converges_in_one_solve():
+    doc = Document()
+    walls = doc.add_wall_path([(-2, -2), (-2, 1), (3, 2)], closed=True)
+    wall = walls[2]
+    doc.add_constraint({
+        "type": "distance",
+        "a": {"kind": "vertex", "pid": wall.corners[0]},
+        "b": {"kind": "vertex", "pid": wall.corners[3]},
+        "length": 5.76,
+    })
+
+    status = solve_document(doc)
+
+    assert status.converged
+    assert status.max_residual < 1e-6
 
 
 def test_wall_stays_rectangular_after_perturbation():
@@ -210,6 +259,56 @@ def test_thickness_floor_flips_negative_wall():
     c3 = doc.points[pids[3]]
     g = (c1.x - c0.x) * (c3.y - c0.y) - (c1.y - c0.y) * (c3.x - c0.x)
     assert g > 0  # thickness positive again
+
+
+def test_open_wall_path_angles_preserve_initial_orientation():
+    doc = Document()
+    walls = doc.add_wall_path([(0, 0), (2, 0), (2, 2)])
+    before = [
+        math.atan2(
+            doc.points[wall.corners[3]].y - doc.points[wall.corners[0]].y,
+            doc.points[wall.corners[3]].x - doc.points[wall.corners[0]].x,
+        )
+        for wall in walls
+    ]
+
+    status = solve_document(doc)
+
+    after = [
+        math.atan2(
+            doc.points[wall.corners[3]].y - doc.points[wall.corners[0]].y,
+            doc.points[wall.corners[3]].x - doc.points[wall.corners[0]].x,
+        )
+        for wall in walls
+    ]
+    assert status.converged
+    assert after == pytest.approx(before, abs=1e-6)
+
+
+def test_closed_wall_path_angles_preserve_initial_orientation():
+    doc = Document()
+    walls = doc.add_wall_path(
+        [(0, 0), (2, 0), (2, 2), (0, 2)], closed=True
+    )
+    before = [
+        math.atan2(
+            doc.points[wall.corners[3]].y - doc.points[wall.corners[0]].y,
+            doc.points[wall.corners[3]].x - doc.points[wall.corners[0]].x,
+        )
+        for wall in walls
+    ]
+
+    status = solve_document(doc)
+
+    after = [
+        math.atan2(
+            doc.points[wall.corners[3]].y - doc.points[wall.corners[0]].y,
+            doc.points[wall.corners[3]].x - doc.points[wall.corners[0]].x,
+        )
+        for wall in walls
+    ]
+    assert status.converged
+    assert after == pytest.approx(before, abs=1e-6)
 
 
 def test_angle_between_wall_axes():
