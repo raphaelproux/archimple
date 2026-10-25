@@ -32,6 +32,9 @@ let tool = "select";
 let units = "m";
 let showC = true;
 let pending = [];   // collected clicks for multi-step tools
+let measurements = [];
+let nextMeasurementId = 1;
+let pendingMeasurementsRestore = null;
 let hover = null;   // {kind, id, side?}
 let selection = null; // {kind, id}
 let drag = null;
@@ -40,7 +43,7 @@ let symbolPlacement = null;
 let rotate = null;
 let pan = null;
 let symbolResizePreview = null;
-let mouse = { wx: 0, wy: 0, sx: 0, sy: 0, inside: false };
+let mouse = { wx: 0, wy: 0, sx: 0, sy: 0, inside: false, shiftKey: false };
 let dpr = window.devicePixelRatio || 1;
 
 /* ---------- websocket ---------- */
@@ -61,6 +64,13 @@ function connect() {
     const msg = JSON.parse(ev.data);
     if (msg.points) {
       state = msg;
+      if (pendingMeasurementsRestore) {
+        measurements = pendingMeasurementsRestore;
+        nextMeasurementId = measurements.reduce((next, item) => Math.max(next, Number(item.id) + 1 || next), 1);
+        pendingMeasurementsRestore = null;
+        selection = null;
+        pending = [];
+      }
       if (symbolResizePreview) {
         const symbol = state.symbols.find(item => item.id === symbolResizePreview.symbolId);
         if (symbolResizePreview.released && symbol
@@ -108,6 +118,7 @@ function connect() {
       draw();
     } else if (msg.op === "error") {
       pendingSymbolSave = null;
+      pendingMeasurementsRestore = null;
       flash(msg.message);
     }
   };
@@ -727,6 +738,115 @@ function snapWorld(w, exclude) {
   };
 }
 
+function snapMeasurementPoint(w, enabled) {
+  if (!enabled) return { x: w.x, y: w.y };
+  let best = null, bestDistance = 12 / view.scale;
+  for (const point of Object.values(state.points)) {
+    const distance = Math.hypot(point.x - w.x, point.y - w.y);
+    if (distance < bestDistance) {
+      best = { x: point.x, y: point.y };
+      bestDistance = distance;
+    }
+  }
+  if (best) return best;
+  const edges = [];
+  for (const wall of state.walls || []) {
+    if (!hasCorners(wall)) continue;
+    const points = corners(wall);
+    for (let index = 0; index < points.length; index++) {
+      edges.push([points[index], points[(index + 1) % points.length]]);
+    }
+  }
+  for (const rectangle of state.rectangles || []) {
+    const points = rectanglePoints(rectangle);
+    for (let index = 0; index < points.length; index++) {
+      edges.push([points[index], points[(index + 1) % points.length]]);
+    }
+  }
+  for (const [a, b] of edges) {
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const lengthSquared = dx * dx + dy * dy;
+    const t = lengthSquared > 0
+      ? Math.max(0, Math.min(1, ((w.x - a.x) * dx + (w.y - a.y) * dy) / lengthSquared))
+      : 0;
+    const point = { x: a.x + t * dx, y: a.y + t * dy };
+    const distance = Math.hypot(point.x - w.x, point.y - w.y);
+    if (distance < bestDistance) {
+      best = point;
+      bestDistance = distance;
+    }
+  }
+  return best || { x: w.x, y: w.y };
+}
+
+function polygonArea(points) {
+  let twiceArea = 0;
+  for (let index = 0; index < points.length; index++) {
+    const a = points[index], b = points[(index + 1) % points.length];
+    twiceArea += a.x * b.y - b.x * a.y;
+  }
+  return Math.abs(twiceArea) / 2;
+}
+
+function polygonCentroid(points) {
+  let twiceArea = 0, x = 0, y = 0;
+  for (let index = 0; index < points.length; index++) {
+    const a = points[index], b = points[(index + 1) % points.length];
+    const cross = a.x * b.y - b.x * a.y;
+    twiceArea += cross;
+    x += (a.x + b.x) * cross;
+    y += (a.y + b.y) * cross;
+  }
+  if (Math.abs(twiceArea) < 1e-9) {
+    return points.reduce((center, point) => ({ x: center.x + point.x / points.length, y: center.y + point.y / points.length }), { x: 0, y: 0 });
+  }
+  return { x: x / (3 * twiceArea), y: y / (3 * twiceArea) };
+}
+
+function polygonLabelPoint(points) {
+  const centroid = polygonCentroid(points);
+  if (pointInPolygon(centroid, points)) return centroid;
+  const minX = Math.min(...points.map(point => point.x));
+  const maxX = Math.max(...points.map(point => point.x));
+  const minY = Math.min(...points.map(point => point.y));
+  const maxY = Math.max(...points.map(point => point.y));
+  let best = points[0], bestDistance = -1;
+  for (let xIndex = 0; xIndex <= 20; xIndex++) {
+    for (let yIndex = 0; yIndex <= 20; yIndex++) {
+      const candidate = { x: minX + (maxX - minX) * xIndex / 20, y: minY + (maxY - minY) * yIndex / 20 };
+      if (!pointInPolygon(candidate, points)) continue;
+      const distance = points.reduce((minimum, point, index) => Math.min(minimum,
+        distToSegWorld(candidate, point, points[(index + 1) % points.length])), Infinity);
+      if (distance > bestDistance) { best = candidate; bestDistance = distance; }
+    }
+  }
+  return best;
+}
+
+function pointInPolygon(point, points) {
+  let inside = false;
+  for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+    const a = points[i], b = points[j];
+    if ((a.y > point.y) !== (b.y > point.y)
+        && point.x < (b.x - a.x) * (point.y - a.y) / (b.y - a.y) + a.x) inside = !inside;
+  }
+  return inside;
+}
+
+function pickMeasurement(w) {
+  for (let index = measurements.length - 1; index >= 0; index--) {
+    const item = measurements[index];
+    if (item.kind === "area" && (pointInPolygon(w, item.points) || item.points.some((point, edge) =>
+      distToSegScreen(w.x * view.scale + view.ox, view.oy - w.y * view.scale,
+        toScreen(point.x, point.y), toScreen(item.points[(edge + 1) % item.points.length].x, item.points[(edge + 1) % item.points.length].y)) <= 8))) return item;
+    if (item.kind === "distance" && distToSegScreen(
+      w.x * view.scale + view.ox, view.oy - w.y * view.scale,
+      toScreen(item.points[0].x, item.points[0].y), toScreen(item.points[1].x, item.points[1].y),
+    ) <= 8) return item;
+  }
+  return null;
+}
+
 /* ---------- transforms ---------- */
 function toScreen(x, y) {
   return { x: x * view.scale + view.ox, y: view.oy - y * view.scale };
@@ -881,6 +1001,7 @@ function draw() {
   }
   drawRectangles();
   drawOpenings();
+  drawMeasurements();
   drawPreview();
   drawHover();
 }
@@ -1152,7 +1273,71 @@ function roundRect(x, y, w, h, r) {
   ctx.closePath();
 }
 
+function drawMeasurements() {
+  for (const measurement of measurements) {
+    const selected = selection?.kind === "measurement" && selection.id === measurement.id;
+    const color = selected ? "#ffb454" : "#f0c674";
+    const points = measurement.points.map(point => toScreen(point.x, point.y));
+    if (measurement.kind === "area") {
+      ctx.beginPath();
+      ctx.moveTo(points[0].x, points[0].y);
+      for (const point of points.slice(1)) ctx.lineTo(point.x, point.y);
+      ctx.closePath();
+      ctx.fillStyle = selected ? "rgba(255,180,84,0.22)" : "rgba(240,198,116,0.16)";
+      ctx.fill();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = selected ? 2 : 1.5;
+      ctx.setLineDash([5, 4]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      const center = polygonLabelPoint(measurement.points);
+      const screen = toScreen(center.x, center.y);
+      label(screen.x, screen.y, `${measurement.area.toFixed(2)} m²`, color);
+    } else {
+      ctx.strokeStyle = color;
+      ctx.lineWidth = selected ? 1.5 : 1;
+      ctx.setLineDash([5, 4]);
+      line2(points[0], points[1]);
+      ctx.setLineDash([]);
+      label((points[0].x + points[1].x) / 2, (points[0].y + points[1].y) / 2 - 14,
+        fmtLen(Math.hypot(measurement.points[1].x - measurement.points[0].x, measurement.points[1].y - measurement.points[0].y)), color);
+    }
+  }
+}
+
 function drawPreview() {
+  if ((tool === "area" || tool === "measure-distance") && mouse.inside && pending.length) {
+    const point = tool === "area"
+      ? snapWorld({ x: mouse.wx, y: mouse.wy })
+      : snapMeasurementPoint({ x: mouse.wx, y: mouse.wy }, mouse.shiftKey);
+    if (tool === "area") {
+      const points = [...pending, point].map(vertex => toScreen(vertex.x, vertex.y));
+      ctx.beginPath();
+      ctx.moveTo(points[0].x, points[0].y);
+      for (const vertex of points.slice(1)) ctx.lineTo(vertex.x, vertex.y);
+      if (pending.length >= 2) ctx.closePath();
+      ctx.strokeStyle = "rgba(240,198,116,0.75)";
+      ctx.setLineDash([5, 4]);
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.setLineDash([]);
+      if (pending.length >= 2) {
+        const area = polygonArea([...pending, point]);
+        const center = polygonLabelPoint([...pending, point]);
+        const screen = toScreen(center.x, center.y);
+        label(screen.x, screen.y, `${area.toFixed(2)} m²`, "#f0c674");
+      }
+    } else {
+      const start = toScreen(pending[0].x, pending[0].y), end = toScreen(point.x, point.y);
+      ctx.strokeStyle = "rgba(240,198,116,0.8)";
+      ctx.setLineDash([5, 4]);
+      ctx.lineWidth = 1;
+      line2(start, end);
+      ctx.setLineDash([]);
+      label((start.x + end.x) / 2, (start.y + end.y) / 2 - 14,
+        fmtLen(Math.hypot(point.x - pending[0].x, point.y - pending[0].y)), "#f0c674");
+    }
+  }
   if (tool === "wall-path" && pending.length && mouse.inside) {
     const vertices = pending.map(point => ({ x: point.x, y: point.y }));
     vertices.push(snapWorld({ x: mouse.wx, y: mouse.wy }));
@@ -1338,7 +1523,23 @@ function drawPreview() {
 
 function drawHover() {
   if (!hover) return;
-  if (hover.kind === "opening-handle") {
+  if (hover.kind === "measurement") {
+    const measurement = measurements.find(item => item.id === hover.id);
+    if (measurement) {
+      ctx.strokeStyle = "rgba(240,198,116,0.8)";
+      ctx.lineWidth = 2;
+      if (measurement.kind === "area") {
+        const points = measurement.points.map(point => toScreen(point.x, point.y));
+        ctx.beginPath();
+        ctx.moveTo(points[0].x, points[0].y);
+        for (const point of points.slice(1)) ctx.lineTo(point.x, point.y);
+        ctx.closePath();
+        ctx.stroke();
+      } else {
+        line2(toScreen(measurement.points[0].x, measurement.points[0].y), toScreen(measurement.points[1].x, measurement.points[1].y));
+      }
+    }
+  } else if (hover.kind === "opening-handle") {
     const [openingId, handle] = hover.id.split(":");
     const opening = (state.openings || []).find(item => item.id === openingId);
     const ends = opening && openingEnds(opening);
@@ -1408,6 +1609,7 @@ function drawHover() {
 
 /* ---------- interaction ---------- */
 function setTool(t) {
+  if (tool !== t) hover = null;
   tool = t;
   pending = [];
   if (!symbolPlacement && t !== "rectangle") rectangleGesture = null;
@@ -1417,6 +1619,7 @@ function setTool(t) {
   }
   hintEl.classList.remove("error");
   hintEl.textContent = HINTS[t] || "";
+  draw();
 }
 
 const HINTS = {
@@ -1426,6 +1629,8 @@ const HINTS = {
   cut: "Click a wall to split it at that position (Esc cancels)",
   opening: "Click two points along a wall axis to create an opening (Esc cancels)",
   dim: "Click two targets (opening segment or handle, corner, wall edge, or wall axis end)",
+  area: "Click polygon vertices; click near the first point to close, or press Enter (Esc cancels)",
+  "measure-distance": "Click two points to measure; hold Shift to snap to corners or wall edges (Esc cancels)",
   angle: "Click two wall axes or rectangle sides, then enter the angle",
   coincident: "Click two wall corners to make them coincident",
   horizontal: "Click a wall axis or rectangle side to make it horizontal",
@@ -1460,6 +1665,9 @@ function updateHover(w) {
   } else if (tool === "wall-path") {
     const target = pickWallPathCorner(w);
     hover = target ? { kind: "point", id: target.pid } : null;
+  } else if (tool === "measure-distance" || tool === "area") {
+    const measurement = pickMeasurement(w);
+    hover = measurement ? { kind: "measurement", id: measurement.id } : null;
   } else if (tool === "dim") {
     const target = pickTarget(w);
     if (!target) hover = null;
@@ -1475,8 +1683,10 @@ function updateHover(w) {
       hover = { kind: "point", id: target.pid };
     }
   } else if (tool === "select") {
-    const rectangle = pickRectangle(w);
-    if (rectangle) hover = { kind: "rectangle", id: rectangle.id };
+    const measurement = pickMeasurement(w);
+    const rectangle = measurement ? null : pickRectangle(w);
+    if (measurement) hover = { kind: "measurement", id: measurement.id };
+    else if (rectangle) hover = { kind: "rectangle", id: rectangle.id };
     else {
       const opening = pickOpening(w);
       if (opening) hover = { kind: "opening", id: opening.id };
@@ -1598,6 +1808,38 @@ canvas.addEventListener("pointerdown", (e) => {
   }
   if (e.button !== 0) return;
 
+  if (tool === "area") {
+    const point = snapWorld(w);
+    if (pending.length >= 3 && Math.hypot(point.x - pending[0].x, point.y - pending[0].y) < 0.08) {
+      const area = polygonArea(pending);
+      if (area > 1e-6) {
+        measurements.push({ id: nextMeasurementId++, kind: "area", points: pending.map(vertex => ({ x: vertex.x, y: vertex.y })), area });
+      }
+      pending = [];
+      selection = null;
+      draw();
+      return;
+    }
+    if (pending.length && Math.hypot(point.x - pending[pending.length - 1].x, point.y - pending[pending.length - 1].y) < 0.01) return;
+    pending.push({ x: point.x, y: point.y });
+    draw();
+    return;
+  }
+  if (tool === "measure-distance") {
+    const point = snapMeasurementPoint(w, e.shiftKey);
+    if (!pending.length) {
+      pending.push(point);
+      draw();
+      return;
+    }
+    const start = pending[0];
+    if (Math.hypot(point.x - start.x, point.y - start.y) < 1e-9) return;
+    measurements.push({ id: nextMeasurementId++, kind: "distance", points: [start, point] });
+    pending = [];
+    selection = null;
+    draw();
+    return;
+  }
   if (tool === "wall-path") {
     const point = snapWorld(w);
     if (pending.length > 2 && Math.hypot(
@@ -1657,6 +1899,13 @@ canvas.addEventListener("pointerdown", (e) => {
   }
 
   if (tool === "select") {
+    const measurement = pickMeasurement(w);
+    if (measurement) {
+      selection = { kind: "measurement", id: measurement.id };
+      syncPanel();
+      draw();
+      return;
+    }
     let rectangle = null, corner = null;
     for (const candidate of state.rectangles || []) {
       const index = pickRectangleCorner(candidate, w);
@@ -1942,7 +2191,7 @@ canvas.addEventListener("pointerdown", (e) => {
 canvas.addEventListener("pointermove", (e) => {
   const w = eventWorld(e);
   const r = canvas.getBoundingClientRect();
-  mouse = { wx: w.x, wy: w.y, sx: e.clientX - r.left, sy: e.clientY - r.top, inside: true };
+  mouse = { wx: w.x, wy: w.y, sx: e.clientX - r.left, sy: e.clientY - r.top, inside: true, shiftKey: e.shiftKey };
   coordsEl.textContent = `x: ${fmtLen(w.x)}  y: ${fmtLen(w.y)}`;
 
   if (drag && drag.mode === "opening") {
@@ -2507,24 +2756,32 @@ window.addEventListener("keydown", (e) => {
   if (!dialogEl.hidden || !symbolModal.hidden) return;
   if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
   const tools = {
-    s: "select", w: "wall", p: "wall-path", x: "cut", o: "opening", d: "dim", a: "angle",
-    c: "coincident", h: "horizontal", v: "vertical",
+    s: "select", w: "wall", p: "wall-path", x: "cut", o: "opening", d: "dim", n: "measure-distance", g: "area",
+    a: "angle", c: "coincident", h: "horizontal", v: "vertical",
   };
   const k = e.key.toLowerCase();
   if (tools[k]) { setTool(tools[k]); return; }
-  if (e.key === "Enter" && tool === "wall-path") {
+  if (e.key === "Enter" && (tool === "wall-path" || tool === "area")) {
     if (pending.length < 3) {
-      flash("a closed wall path needs at least three points");
+      flash(tool === "area" ? "an area needs at least three points" : "a closed wall path needs at least three points");
       return;
     }
-    send({
-      op: "add_wall_path",
-      vertices: pending.map(point => [point.x, point.y]),
-      joins: pending.map(point => point.pid),
-      closed: true,
-      thickness: wallThickness,
-    });
+    if (tool === "wall-path") {
+      send({
+        op: "add_wall_path",
+        vertices: pending.map(point => [point.x, point.y]),
+        joins: pending.map(point => point.pid),
+        closed: true,
+        thickness: wallThickness,
+      });
+    } else {
+      const area = polygonArea(pending);
+      if (area > 1e-6) {
+        measurements.push({ id: nextMeasurementId++, kind: "area", points: pending.map(point => ({ x: point.x, y: point.y })), area });
+      }
+    }
     pending = [];
+    draw();
     return;
   }
   if (e.key === "Escape") {
@@ -2537,9 +2794,14 @@ window.addEventListener("keydown", (e) => {
     draw();
   } else if (e.key === "Delete" || e.key === "Backspace") {
     if (selection) {
-      send({ op: "delete", id: selection.id });
+      if (selection.kind === "measurement") {
+        measurements = measurements.filter(item => item.id !== selection.id);
+      } else {
+        send({ op: "delete", id: selection.id });
+      }
       selection = null;
       syncPanel();
+      draw();
     }
   }
 });
@@ -2577,7 +2839,10 @@ unitM.addEventListener("click", () => setUnits("m"));
 unitCm.addEventListener("click", () => setUnits("cm"));
 document.getElementById("solve-btn").addEventListener("click", () => send({ op: "solve" }));
 document.getElementById("save-map-btn").addEventListener("click", () => {
-  const documentData = { ...state };
+  const documentData = { ...state, measurements: measurements.map(item => ({
+    ...item,
+    points: item.points.map(point => ({ x: point.x, y: point.y })),
+  })) };
   delete documentData.status;
   const blob = new Blob([JSON.stringify(documentData, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
@@ -2599,6 +2864,20 @@ loadMapInput.addEventListener("change", async () => {
     if (!documentData || typeof documentData !== "object" || Array.isArray(documentData)) {
       throw new Error("map file must contain a JSON object");
     }
+    const importedMeasurements = Array.isArray(documentData.measurements)
+      ? documentData.measurements.filter(item => item && (item.kind === "area" || item.kind === "distance")
+        && Array.isArray(item.points)
+        && (item.kind === "area" ? item.points.length >= 3 : item.points.length === 2)
+        && item.points.every(point => Number.isFinite(point.x) && Number.isFinite(point.y)))
+        .map(item => ({
+          id: Number.isSafeInteger(item.id) && item.id > 0 ? item.id : nextMeasurementId++,
+          kind: item.kind,
+          points: item.points.map(point => ({ x: point.x, y: point.y })),
+          ...(item.kind === "area" ? { area: polygonArea(item.points) } : {}),
+        }))
+      : [];
+    delete documentData.measurements;
+    pendingMeasurementsRestore = importedMeasurements;
     send({ op: "load", document: documentData });
   } catch (error) {
     flash(`could not load map: ${error.message}`);
@@ -2617,6 +2896,7 @@ document.getElementById("clear-map-btn").addEventListener("click", () => {
     symbols: [],
     constraints: [],
   };
+  pendingMeasurementsRestore = [];
   send({ op: "load", document: emptyDocument });
 });
 
